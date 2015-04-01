@@ -284,16 +284,27 @@ class DataSplitterBaseTask(luigi.Task):
         return PreprocessedCourseData()
 
     def output(self):
-        param_suffix = '-'.join([str(filt) for filt in self.filters])
-        ng_suffix = 'ng' if self.discard_nongrade else ''
-        parts = [self.suffix, ng_suffix]
-        suffix = '-'.join(parts)
-        if suffix and not suffix.startswith('-'):
-            suffix = '-' + suffix
+        # construct output name
+        base = 'data'
+        parts = ['ucg']  # user-course-grade = ucg
 
-        base = 'data/ucg-{}{}.%s.{}'.format(param_suffix, suffix, self.ext)
-        train = base % 'train'
-        test =  base % 'test'
+        # parameter suffix part
+        param_suffix = '-'.join([str(filt) for filt in self.filters])
+        if param_suffix:
+            parts.append(param_suffix)
+
+        # indicate if W/S/NC grades are being included in train set
+        if not self.discard_nongrade:
+            parts.append('ng')
+
+        # include optional class-specific suffix
+        if self.suffix:
+            parts.append(self.suffix)
+
+        fbase = os.path.join(base, '-'.join(parts))
+        fname = '{}.%s.{}'.format(fbase, self.ext)
+        train = fname % 'train'
+        test =  fname % 'test'
         return {
             'train': luigi.LocalTarget(train),
             'test': luigi.LocalTarget(test)
@@ -495,7 +506,7 @@ class RunLibFM(luigi.Task):
             parts.append(param_suffix)
 
         # nongrade part (did we include W/S/NC grades?)
-        if self.discard_nongrade:
+        if not self.discard_nongrade:
             parts.append('ng')
 
         # time information part
@@ -507,7 +518,8 @@ class RunLibFM(luigi.Task):
         parts.append(str(self.iterations))
 
         # initial standard deviation part (init_stdev)
-        parts.append(str(self.init_stdev))
+        std = ''.join(str(init_stdev).split('.'))
+        parts.append(std)
 
         # bias terms part
         if self.use_bias:
@@ -530,46 +542,74 @@ class RunLibFM(luigi.Task):
             output = '\n'.join(['\t'.join(result) for result in results])
             f.write(output)
 
-# TODO: currently does not work; some issue with the conversion script being
-# called using Popen... not sure why, but it breaks when reading input files
-class UserCourseGradeLibFMFaulty(luigi.Task):
-    """Convert triples to libFM format."""
-    train_filters = luigi.Parameter(default='0-14')
 
-    script_path = 'libfm-1.42.src/scripts/triple_format_to_libfm.pl'
+class LibFMRunnerTask(luigi.Task):
+    """Wrap up RunLibFM to run a specific variation with class params."""
+    train_filters = luigi.Parameter(
+        description='Specify how to split the train set from the test set.')
+
+    def __init__(self, *args, **kwargs):
+        super(LibFMRunnerTask, self).__init__(*args, **kwargs)
+        self.task = RunLibFM(**self.param_kwargs)
 
     def requires(self):
-        return UserCourseGradeTriples(train_filters=self.train_filters)
+        return UserCourseGradeLibFM(
+            train_filters=self.train_filters, time=self.task.time)
 
     def output(self):
-        fnames = [f.path for f in self.input().values()]
-        parts = map(os.path.splitext, fnames)
-        outnames = ['%s.libfm' % base for base, ext in parts]
-        targets = map(luigi.LocalTarget, outnames)
-        return targets
+        return luigi.LocalTarget(self.task.output().path)
 
     def run(self):
-        # first convert the files to the libFM format
-        infiles = self.input()
-        inputs = [infiles['train'].path, infiles['test'].path]
-        args = [
-            self.script_path,
-            '-in', ','.join(inputs),
-            '-target', '2',
-            '-separator', '"\\t"'
-        ]
-        print ' '.join(args)
-        proc = sub.Popen(args, stdout=sub.PIPE)
-        print proc.communicate()[0]
+        self.task.run()
 
-        # now clean up the file extensions
-        parts = map(os.path.splitext, inputs)
-        outnames = ['%s%s.libfm' % (base, ext) for base, ext in parts]
-        fixed = [f.path for f in self.output()]
 
-        for old, new in zip(outnames, fixed):
-            print 'moving %s to %s' % (old, new)
-            os.rename(old, new)
+class SVD(LibFMRunnerTask):
+    """Run libFM to emulate SVD."""
+    pass
+
+class BiasedSVD(LibFMRunnerTask):
+    """Run libFM to emulate biased SVD."""
+    use_bias = luigi.BoolParameter(default=True)
+
+class TimeSVD(LibFMRunnerTask):
+    """Run libFM to emulate TimeSVD."""
+    time = luigi.Parameter(default="cat")
+
+class BiasedTimeSVD(TimeSVD):
+    """Run libFM to emulate biased TimeSVD."""
+    use_bias = luigi.BoolParameter(default=True)
+
+class BPTF(LibFMRunnerTask):
+    """Run libFM to emulate Bayesian Probabilistic Tensor Factorization."""
+    time = luigi.Parameter(default="bin")
+
+class BiasedBPTF(BPTF):
+    """Run libFM to emulate biased BPTF."""
+    use_bias = luigi.BoolParameter(default=True)
+
+
+class RunOnSplit(LibFMRunnerTask):
+    """Run all available methods via libFM for a particular train/test split."""
+    train_filters = luigi.Parameter(
+        description='Specify how to split the train set from the test set.')
+
+    def requires(self):
+        yield SVD(**self.param_kwargs)
+        yield BiasedSVD(**self.param_kwargs)
+        yield TimeSVD(**self.param_kwargs)
+        yield BiasedTimeSVD(**self.param_kwargs)
+        yield BPTF(**self.param_kwargs)
+        yield BiasedBPTF(**self.param_kwargs)
+
+
+class RunAll(luigi.Task):
+    """Run all available methods on 0-4 and 0-7 train/test splits."""
+
+    splits = ["0-4", "0-7"]
+
+    def requires(self):
+        for split in self.splits:
+            yield RunOnSplit(train_filters=split)
 
 
 if __name__ == "__main__":
