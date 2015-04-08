@@ -1,4 +1,5 @@
 import os
+import csv
 import subprocess as sub
 
 import luigi
@@ -267,26 +268,33 @@ class TrainTestFilter(object):
         return data[~self.mask(data)]
 
 
-class DataSplitterBaseTask(luigi.Task):
-    """Functionality to split train/test data, no run method."""
-    train_filters = luigi.Parameter(default='0-14')
-    discard_nongrade = luigi.Parameter(default=True)
+class UsesTrainTestSplit(luigi.Task):
+    """Base task for train/test split args and filters init."""
+    train_filters = luigi.Parameter(
+        default='0-14',
+        description='Specify how to split the train set from the test set.')
+    discard_nongrade = luigi.Parameter(
+        default=True,
+        description='drop W/S/NC grades from training data if True')
+    backfill_cold_students = luigi.IntParameter(
+        default=3,
+        description="number of courses to backfill for cold-start students")
+    backfill_cold_courses = luigi.IntParameter(
+        default=3,
+        description="number of courses to backfill for cold-start courses")
 
-    ext = 'tsv'
-    suffix = ''
+    base = 'data'  # directory to write files to
+    ext = 'tsv'    # final file extension for output files
+    prefix = 'ucg' # prefix for all output files
+    suffix = ''    # class-specific suffix that goes before ext on output names
 
     def __init__(self, *args, **kwargs):
-        super(DataSplitterBaseTask, self).__init__(*args, **kwargs)
+        super(UsesTrainTestSplit, self).__init__(*args, **kwargs)
         self.filters = \
             [TrainTestFilter(filt) for filt in self.train_filters.split()]
 
-    def requires(self):
-        return PreprocessedCourseData()
-
-    def output(self):
-        # construct output name
-        base = 'data'
-        parts = ['ucg']  # user-course-grade = ucg
+    def output_base_fname(self):
+        parts = [self.prefix] if self.prefix else []
 
         # parameter suffix part
         param_suffix = '-'.join([str(filt) for filt in self.filters])
@@ -297,12 +305,28 @@ class DataSplitterBaseTask(luigi.Task):
         if not self.discard_nongrade:
             parts.append('ng')
 
+        # indicate whether cold-start backfilling was done for students/courses
+        if self.backfill_cold_students:
+            parts.append('scs%d' % self.backfill_cold_students)
+        if self.backfill_cold_courses:
+            parts.append('ccs%d' % self.backfill_cold_courses)
+
         # include optional class-specific suffix
         if self.suffix:
             parts.append(self.suffix)
 
-        fbase = os.path.join(base, '-'.join(parts))
-        fname = '{}.%s.{}'.format(fbase, self.ext)
+        fbase = os.path.join(self.base, '-'.join(parts))
+        return '{}.%s.{}'.format(fbase, self.ext)
+
+
+class DataSplitterBaseTask(UsesTrainTestSplit):
+    """Functionality to split train/test data, no run method."""
+
+    def requires(self):
+        return PreprocessedCourseData()
+
+    def output(self):
+        fname = self.output_base_fname()
         train = fname % 'train'
         test =  fname % 'test'
         return {
@@ -321,6 +345,37 @@ class DataSplitterBaseTask(luigi.Task):
         data = data[~data['grdpts'].isnull()]
         return data
 
+
+    def backfill(self, train, test, key, firstn):
+        """Used to prevent cold-start records.
+
+        :param DataFrame train: The training data.
+        :param DataFrame test: The test data.
+        :param str key: The key to backfill records for.
+        :param int firstn: How many records to backfill for cold-starts.
+
+        """
+        if not firstn:  # specified 0 records for backfill
+            return (train, test)
+
+        diff = np.setdiff1d(test[key].values, train[key].values)
+        diff_mask = test[key].isin(diff)
+        diff_records = test[diff_mask]
+
+        # figure out which records to transfer from test set to train set
+        # some keys will have less records than specified
+        gb = diff_records.groupby(key)
+        counts = gb[key].transform('count')
+        tokeep = counts - firstn
+        tokeep[tokeep < 0] = 0
+
+        # update train/test sets
+        removing = gb.head(firstn)
+        keeping = gb.tail(tokeep)
+        test = pd.concat((test[~diff_mask], keeping))
+        train = pd.concat((train, removing))
+        return (train, test)
+
     def split_data(self):
         data = self.read_data()
 
@@ -331,7 +386,7 @@ class DataSplitterBaseTask(luigi.Task):
         train = pd.concat([f.train(data) for f in self.filters]).drop_duplicates()
         test = pd.concat([f.test(data) for f in self.filters]).drop_duplicates()
 
-        # remove W/S/NC from test set
+        # remove W/S/NC from test set; it never makes sense to test on these
         toremove = ['W', 'S', 'NC']
         test = test[~test.GRADE.isin(toremove)]
 
@@ -339,23 +394,12 @@ class DataSplitterBaseTask(luigi.Task):
         if self.discard_nongrade:
             train = train[~train.GRADE.isin(toremove)]
 
-        # ensure all classes in the test set are also in the training set
-        diff = np.setdiff1d(test['cid'].values, train['cid'].values)
-        diff_mask = test['cid'].isin(diff)
-        diff_courses = test[diff_mask]
-
-        # figure out which records to transfer from test set to train set
-        topn = 3
-        gb = diff_courses.groupby('cid')
-        counts = gb['cid'].transform('count')
-        tokeep = counts - topn
-        tokeep[tokeep < 0] = 0
-
-        # update train/test sets
-        removing = gb.head(topn)
-        keeping = gb.tail(tokeep)
-        test = pd.concat((test[~diff_mask], keeping))
-        train = pd.concat((train, removing))
+        # if instructed to avoid student/course cold-start,
+        # ensure all students/courses in the test set are also in the train set
+        train, test = self.backfill(
+            train, test, 'sid', self.backfill_cold_students)
+        train, test = self.backfill(
+            train, test, 'cid', self.backfill_cold_courses)
         return (train, test)
 
 
@@ -418,7 +462,11 @@ def write_libfm(f, data, userid='sid', itemid='cid', rating='grdpts',
 
 class UserCourseGradeLibFM(DataSplitterBaseTask):
     """Output user-course grade matrix in libFM format."""
-    time = luigi.Parameter(default='')  # include time attributes
+    time = luigi.Parameter(
+        default='',
+        description='if empty; no time attributes, ' +
+                    'cat = categorical encoding (TimeSVD), ' +
+                    'bin = binary, one-hot encoding (BPTF)')
     ext = 'libfm'
 
     def __init__(self, *args, **kwargs):
@@ -461,17 +509,9 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
             write_libfm_data(f, test)
 
 
-class RunLibFM(luigi.Task):
-    train_filters = luigi.Parameter(
-        description='Specify how to split the train set from the test set.')
-    time = luigi.Parameter(
-        default='',
-        description='cat=categorical, bin=binary-encoded, default=time unused')
-    discard_nongrade = luigi.Parameter(
-        default=True,
-        description='drop W/S/NC grades from training data if True')
+class RunLibFM(UserCourseGradeLibFM):
     iterations = luigi.IntParameter(
-        default=200,
+        default=100,
         description='number of iterations to use for learning')
     init_stdev = luigi.FloatParameter(
         default=0.3,
@@ -486,47 +526,37 @@ class RunLibFM(luigi.Task):
         default=20,
         description='end of dimension range to produce results for, inclusive')
 
-    def __init__(self, *args, **kwargs):
-        super(RunLibFM, self).__init__(*args, **kwargs)
-        self.filters = \
-            [TrainTestFilter(filt) for filt in self.train_filters.split()]
+    prefix = 'libfm'
+    base = 'outcomes'
+    ext = 'txt'
 
     def requires(self):
-        return UserCourseGradeLibFM(
-            train_filters=self.train_filters, time=self.time,
-            discard_nongrade=self.discard_nongrade)
+        task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
+        params = {k:v for k, v in self.param_kwargs.items()
+                  if k in task_params}
+        return UserCourseGradeLibFM(**params)
 
     def output(self):
-        base = 'outcomes'
         parts = []
-
-        # train/test data filtering part
-        param_suffix = '-'.join([str(filt) for filt in self.filters])
-        if param_suffix:
-            parts.append(param_suffix)
-
-        # nongrade part (did we include W/S/NC grades?)
-        if not self.discard_nongrade:
-            parts.append('ng')
 
         # time information part
         if self.time:
-            parts.append('time')
-            parts.append(self.time)
+            parts.append('time-%s' % self.time)
 
         # number of iterations part
-        parts.append(str(self.iterations))
+        parts.append('i%d' % self.iterations)
 
         # initial standard deviation part (init_stdev)
-        std = ''.join(str(init_stdev).split('.'))
+        std = 's%s' % ''.join(str(self.init_stdev).split('.'))
         parts.append(std)
 
         # bias terms part
         if self.use_bias:
             parts.append('b')
 
-        parts.append('out.txt')
-        fname = os.path.join(base, '-'.join(parts))
+        self.suffix = '-'.join(parts)
+        base_fname = self.output_base_fname()
+        fname = base_fname % 'out'
         return luigi.LocalTarget(fname)
 
     def run(self):
@@ -550,14 +580,24 @@ class LibFMRunnerTask(luigi.Task):
 
     def __init__(self, *args, **kwargs):
         super(LibFMRunnerTask, self).__init__(*args, **kwargs)
-        self.task = RunLibFM(**self.param_kwargs)
+        base_params = [tup[0] for tup in RunLibFM.get_params()]
+        params = {k:v for k,v in self.param_kwargs.items() if k in base_params}
+        self.task = RunLibFM(**params)
+        self.filters = \
+            [TrainTestFilter(filt) for filt in self.train_filters.split()]
 
     def requires(self):
         return UserCourseGradeLibFM(
             train_filters=self.train_filters, time=self.task.time)
 
     def output(self):
-        return luigi.LocalTarget(self.task.output().path)
+        outname = self.task.output().path
+        basedir = os.path.dirname(outname)
+        basename = os.path.basename(outname)
+        parts = basename.split('-')
+        parts[0] = self.__class__.__name__
+        fname = os.path.join(basedir, '-'.join(parts))
+        return luigi.LocalTarget(fname)
 
     def run(self):
         self.task.run()
@@ -600,6 +640,111 @@ class RunOnSplit(LibFMRunnerTask):
         yield BiasedTimeSVD(**self.param_kwargs)
         yield BPTF(**self.param_kwargs)
         yield BiasedBPTF(**self.param_kwargs)
+
+    def output(self):
+        for f in self.input():
+            yield luigi.LocalTarget(f.path)
+
+    def extract_method_name(self, outfile):
+        return os.path.basename(outfile).split('-')[0]
+
+    @property
+    def method_names(self):
+        return [self.extract_method_name(f.path) for f in self.input()]
+
+
+class CompareMethods(RunOnSplit):
+    """Aggregate results from all available methods on a particular split."""
+    topn = luigi.IntParameter(
+        default=3,
+        description="top n results to keep for each method")
+
+    base = 'outcomes'
+
+    def requires(self):
+        return RunOnSplit(train_filters=self.train_filters)
+
+    def output(self):
+        param_suffix = '-'.join([str(filt) for filt in self.filters])
+        fname = 'method-comparison-%s.csv' % param_suffix
+        return luigi.LocalTarget(os.path.join(self.base, fname))
+
+    def read_results(self, f):
+        content = f.read()
+        rows = [l.split('\t') for l in content.split('\n')]
+        rows = [(int(r[0]),float(r[1]),float(r[2])) for r in rows]
+        return rows
+
+    def run(self):
+        results = []  # store results for all methods
+        for input in self.input():
+            with input.open() as f:
+                rows = self.read_results(f)
+
+            # add method name to each result for this method
+            method_name = self.extract_method_name(input.path)
+            for row in rows:
+                row.insert(0, method_name)
+
+            # keep the top 3 results for each method
+            top = list(sorted(rows, key=lambda tup: tup[-1]))
+            results += top[:self.topn]
+
+        # now we have results from all methods, sort them
+        top = list(sorted(results, key=lambda tup: tup[-1]))
+        with self.output().open('w') as f:
+            writer = csv.writer(f)
+            writer.writerow(('method', 'dim', 'train', 'test'))
+            writer.writerows(top)
+
+
+class ResultsMarkdownTable(CompareMethods):
+    """Produce markdown table of results comparison for a data split."""
+    precision = luigi.IntParameter(
+        default=5,
+        description='number of decimal places to keep for error measurements')
+
+    def requires(self):
+        return CompareMethods(**self.param_kwargs)
+
+    def output(self):
+        outname = self.input().path
+        base = os.path.splitext(outname)[0]
+        return luigi.LocalTarget('%s.md' % base)
+
+    def read_results(self, f):
+        header = f.readline().strip().split('\t')
+        content = f.read()
+        rows = [l.split('\t') for l in content.split('\n')]
+        fmt = '%.{}f'.format(self.precision)
+        for row in rows:
+            row[2] = fmt % float(row[2])
+            row[3] = fmt % float(row[3])
+        return header, rows
+
+    def run(self):
+        with self.input().open() as f:
+            header, rows = self.read_results(f)
+
+        # results are already sorted; we simply need to format them as a
+        # markdown table; first find the column widths, leaving a bit of margin
+        # space for readability
+        widths = np.array([[len(item) for item in row] for row in rows]).max()
+        margin = 4
+        colwidths = widths + margin
+        underlines = ['-' * width for width in widths]
+
+        # next, justify the columns appropriately
+        def format_row(row):
+            return [row[0].ljust(colwidths[0])] +
+                   [row[i].rjust(colwidths[i]) for i in range(1, 4)]
+
+        output = [format_row(header), format_row(underlines)]
+        output += [format_row(row) for row in rows]
+
+        # finally, write the table
+        with self.output().open('w') as f:
+            f.write('\n'.join([''.join(row) for row in rows]))
 
 
 class RunAll(luigi.Task):
