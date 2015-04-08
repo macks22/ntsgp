@@ -288,10 +288,9 @@ class UsesTrainTestSplit(luigi.Task):
     prefix = 'ucg' # prefix for all output files
     suffix = ''    # class-specific suffix that goes before ext on output names
 
-    def __init__(self, *args, **kwargs):
-        super(UsesTrainTestSplit, self).__init__(*args, **kwargs)
-        self.filters = \
-            [TrainTestFilter(filt) for filt in self.train_filters.split()]
+    @property
+    def filters(self):
+        return [TrainTestFilter(filt) for filt in self.train_filters.split()]
 
     def output_base_fname(self):
         parts = [self.prefix] if self.prefix else []
@@ -526,7 +525,6 @@ class RunLibFM(UserCourseGradeLibFM):
         default=20,
         description='end of dimension range to produce results for, inclusive')
 
-    prefix = 'libfm'
     base = 'outcomes'
     ext = 'tsv'
 
@@ -556,7 +554,7 @@ class RunLibFM(UserCourseGradeLibFM):
 
         self.suffix = '-'.join(parts)
         base_fname = self.output_base_fname()
-        fname = base_fname % 'out'
+        fname = base_fname % self.__class__.__name__
         return luigi.LocalTarget(fname)
 
     def run(self):
@@ -573,57 +571,52 @@ class RunLibFM(UserCourseGradeLibFM):
             f.write(output)
 
 
-class LibFMRunnerTask(RunLibFM):
-    """Wrap up RunLibFM to run a specific variation with class params."""
-
-    def output(self):
-        super_task = super(LibFMRunnerTask, self)
-        outname = super_task.output().path
-        fname = outname.replace(super_task.prefix, self.__class__.__name__)
-        return luigi.LocalTarget(fname)
-
-
-class SVD(LibFMRunnerTask):
+class SVD(RunLibFM):
     """Run libFM to emulate SVD."""
-    pass
+    use_bias = False
+    time = ''
 
-class BiasedSVD(LibFMRunnerTask):
+class BiasedSVD(SVD):
     """Run libFM to emulate biased SVD."""
-    use_bias = luigi.BoolParameter(default=True)
+    use_bias = True
 
-class TimeSVD(LibFMRunnerTask):
+class TimeSVD(SVD):
     """Run libFM to emulate TimeSVD."""
-    time = luigi.Parameter(default="cat")
+    time = 'cat'
 
 class BiasedTimeSVD(TimeSVD):
     """Run libFM to emulate biased TimeSVD."""
-    use_bias = luigi.BoolParameter(default=True)
+    use_bias = True
 
-class BPTF(LibFMRunnerTask):
+class BPTF(RunLibFM):
     """Run libFM to emulate Bayesian Probabilistic Tensor Factorization."""
-    time = luigi.Parameter(default="bin")
+    use_bias = False
+    time = 'bin'
 
 class BiasedBPTF(BPTF):
     """Run libFM to emulate biased BPTF."""
-    use_bias = luigi.BoolParameter(default=True)
+    use_bias = True
 
 
-class RunAllOnSplit(LibFMRunnerTask):
+class RunAllOnSplit(RunLibFM):
     """Run all available methods via libFM for a particular train/test split."""
-    train_filters = luigi.Parameter(
+    train_filters = luigi.Parameter(  # restate to make non-optional
         description='Specify how to split the train set from the test set.')
+    time = ''     # disable parameter
+    use_bias = '' # disable parameter
 
     def requires(self):
-        yield SVD(**self.param_kwargs)
-        yield BiasedSVD(**self.param_kwargs)
-        yield TimeSVD(**self.param_kwargs)
-        yield BiasedTimeSVD(**self.param_kwargs)
-        yield BPTF(**self.param_kwargs)
-        yield BiasedBPTF(**self.param_kwargs)
+        return [
+            SVD(**self.param_kwargs),
+            BiasedSVD(**self.param_kwargs),
+            TimeSVD(**self.param_kwargs),
+            BiasedTimeSVD(**self.param_kwargs),
+            BPTF(**self.param_kwargs),
+            BiasedBPTF(**self.param_kwargs)
+        ]
 
     def output(self):
-        for f in self.input():
-            yield luigi.LocalTarget(f.path)
+        return [luigi.LocalTarget(f.path) for f in self.input()]
 
     def extract_method_name(self, outfile):
         return os.path.basename(outfile).split('-')[0]
@@ -640,19 +633,21 @@ class CompareMethods(RunAllOnSplit):
         description="top n results to keep for each method")
 
     base = 'outcomes'
+    ext = 'tsv'
+    prefix = 'compare'
+
+    def output(self):
+        base_fname = self.output_base_fname()
+        fname = base_fname % 'top%d' % self.topn
+        return luigi.LocalTarget(fname)
 
     def requires(self):
         return RunAllOnSplit(train_filters=self.train_filters)
 
-    def output(self):
-        param_suffix = '-'.join([str(filt) for filt in self.filters])
-        fname = 'method-comparison-%s.csv' % param_suffix
-        return luigi.LocalTarget(os.path.join(self.base, fname))
-
     def read_results(self, f):
         content = f.read()
         rows = [l.split('\t') for l in content.split('\n')]
-        rows = [(int(r[0]),float(r[1]),float(r[2])) for r in rows]
+        rows = [[int(r[0]),float(r[1]),float(r[2])] for r in rows]
         return rows
 
     def run(self):
@@ -673,9 +668,8 @@ class CompareMethods(RunAllOnSplit):
         # now we have results from all methods, sort them
         top = list(sorted(results, key=lambda tup: tup[-1]))
         with self.output().open('w') as f:
-            writer = csv.writer(f)
-            writer.writerow(('method', 'dim', 'train', 'test'))
-            writer.writerows(top)
+            f.write('\t'.join(('method', 'dim', 'train', 'test')) + '\n')
+            f.write('\n'.join(['\t'.join(map(str, row)) for row in top]))
 
 
 class ResultsMarkdownTable(CompareMethods):
@@ -685,7 +679,9 @@ class ResultsMarkdownTable(CompareMethods):
         description='number of decimal places to keep for error measurements')
 
     def requires(self):
-        return CompareMethods(**self.param_kwargs)
+        kwargs = self.param_kwargs.copy()
+        del kwargs['precision']
+        return CompareMethods(**kwargs)
 
     def output(self):
         outname = self.input().path
@@ -709,7 +705,8 @@ class ResultsMarkdownTable(CompareMethods):
         # results are already sorted; we simply need to format them as a
         # markdown table; first find the column widths, leaving a bit of margin
         # space for readability
-        widths = np.array([[len(item) for item in row] for row in rows]).max()
+        widths = np.array([[len(item) for item in row]
+                           for row in rows]).max(axis=0)
         margin = 4
         colwidths = widths + margin
         underlines = ['-' * width for width in widths]
@@ -724,7 +721,7 @@ class ResultsMarkdownTable(CompareMethods):
 
         # finally, write the table
         with self.output().open('w') as f:
-            f.write('\n'.join([''.join(row) for row in rows]))
+            f.write('\n'.join([''.join(row) for row in output]))
 
 
 class RunAll(luigi.Task):
@@ -734,7 +731,7 @@ class RunAll(luigi.Task):
 
     def requires(self):
         for split in self.splits:
-            yield RunAllOnSplit(train_filters=split)
+            yield ResultsMarkdownTable(train_filters=split)
 
 
 if __name__ == "__main__":
