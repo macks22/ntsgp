@@ -528,7 +528,7 @@ class RunLibFM(UserCourseGradeLibFM):
 
     prefix = 'libfm'
     base = 'outcomes'
-    ext = 'txt'
+    ext = 'tsv'
 
     def requires(self):
         task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
@@ -573,34 +573,14 @@ class RunLibFM(UserCourseGradeLibFM):
             f.write(output)
 
 
-class LibFMRunnerTask(luigi.Task):
+class LibFMRunnerTask(RunLibFM):
     """Wrap up RunLibFM to run a specific variation with class params."""
-    train_filters = luigi.Parameter(
-        description='Specify how to split the train set from the test set.')
-
-    def __init__(self, *args, **kwargs):
-        super(LibFMRunnerTask, self).__init__(*args, **kwargs)
-        base_params = [tup[0] for tup in RunLibFM.get_params()]
-        params = {k:v for k,v in self.param_kwargs.items() if k in base_params}
-        self.task = RunLibFM(**params)
-        self.filters = \
-            [TrainTestFilter(filt) for filt in self.train_filters.split()]
-
-    def requires(self):
-        return UserCourseGradeLibFM(
-            train_filters=self.train_filters, time=self.task.time)
 
     def output(self):
-        outname = self.task.output().path
-        basedir = os.path.dirname(outname)
-        basename = os.path.basename(outname)
-        parts = basename.split('-')
-        parts[0] = self.__class__.__name__
-        fname = os.path.join(basedir, '-'.join(parts))
+        super_task = super(LibFMRunnerTask, self)
+        outname = super_task.output().path
+        fname = outname.replace(super_task.prefix, self.__class__.__name__)
         return luigi.LocalTarget(fname)
-
-    def run(self):
-        self.task.run()
 
 
 class SVD(LibFMRunnerTask):
@@ -628,7 +608,7 @@ class BiasedBPTF(BPTF):
     use_bias = luigi.BoolParameter(default=True)
 
 
-class RunOnSplit(LibFMRunnerTask):
+class RunAllOnSplit(LibFMRunnerTask):
     """Run all available methods via libFM for a particular train/test split."""
     train_filters = luigi.Parameter(
         description='Specify how to split the train set from the test set.')
@@ -653,7 +633,7 @@ class RunOnSplit(LibFMRunnerTask):
         return [self.extract_method_name(f.path) for f in self.input()]
 
 
-class CompareMethods(RunOnSplit):
+class CompareMethods(RunAllOnSplit):
     """Aggregate results from all available methods on a particular split."""
     topn = luigi.IntParameter(
         default=3,
@@ -662,7 +642,7 @@ class CompareMethods(RunOnSplit):
     base = 'outcomes'
 
     def requires(self):
-        return RunOnSplit(train_filters=self.train_filters)
+        return RunAllOnSplit(train_filters=self.train_filters)
 
     def output(self):
         param_suffix = '-'.join([str(filt) for filt in self.filters])
@@ -736,7 +716,7 @@ class ResultsMarkdownTable(CompareMethods):
 
         # next, justify the columns appropriately
         def format_row(row):
-            return [row[0].ljust(colwidths[0])] +
+            return [row[0].ljust(colwidths[0])] + \
                    [row[i].rjust(colwidths[i]) for i in range(1, 4)]
 
         output = [format_row(header), format_row(underlines)]
@@ -754,7 +734,7 @@ class RunAll(luigi.Task):
 
     def requires(self):
         for split in self.splits:
-            yield RunOnSplit(train_filters=split)
+            yield RunAllOnSplit(train_filters=split)
 
 
 if __name__ == "__main__":
