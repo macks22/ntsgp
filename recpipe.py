@@ -305,10 +305,8 @@ class UsesTrainTestSplit(luigi.Task):
             parts.append('ng')
 
         # indicate whether cold-start backfilling was done for students/courses
-        if self.backfill_cold_students:
-            parts.append('scs%d' % self.backfill_cold_students)
-        if self.backfill_cold_courses:
-            parts.append('ccs%d' % self.backfill_cold_courses)
+        parts.append('scs%d' % self.backfill_cold_students)
+        parts.append('ccs%d' % self.backfill_cold_courses)
 
         # include optional class-specific suffix
         if self.suffix:
@@ -381,9 +379,16 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
         # sort data by term number, then by student id
         data = data.sort(['termnum', 'sid'])
 
-        # now do train/test split
+        # now do train/test split; drop duplicates in case filters overlap
         train = pd.concat([f.train(data) for f in self.filters]).drop_duplicates()
         test = pd.concat([f.test(data) for f in self.filters]).drop_duplicates()
+
+        # sometimes cohorts have nan values, and other times students from later
+        # cohorts take courses before they've officially enrolled.
+        start = max([f.cohort_end for f in self.filters])
+        oddball_mask = test.termnum <= start
+        train = pd.concat((train, test[oddball_mask]))
+        test = test[~oddball_mask]
 
         # remove W/S/NC from test set; it never makes sense to test on these
         toremove = ['W', 'S', 'NC']
@@ -473,25 +478,21 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         if self.time:
             self.suffix = 'T%s' % self.time
 
-    def run(self):
-        train, test = self.split_data()
-
-        # libFM has no notion of columns, it simply takes feature vectors with
-        # labels. So we need to re-encode the columns by adding the max row
-        # index.
-        max_row_idx = max(np.concatenate((test.sid.values, train.sid.values)))
-        train.cid += max_row_idx
-        test.cid += max_row_idx
-
-        # If time is included, calculate feature number for categorical feature
-        if self.time == 'bin':
+    def multiplex_time(self, train, test):
+        """If time is included, as a feature, we need to specify how it will be
+        written in the libFM format. The method being emulated changes based on
+        how we choose to encode it. We multiplex based on time in the sense that
+        we define a data writing function that writes the time data differently
+        depending on what the user has specified. This function is returned.
+        """
+        if self.time == 'bin':  # one-hot encoding; BPTF
             max_col_idx = max(
                 np.concatenate((test.cid.values, train.cid.values)))
             train.termnum += max_col_idx
             test.termnum += max_col_idx
             def write_libfm_data(f, data):
                 write_libfm(f, data, timecol='termnum')
-        elif self.time == 'cat':  # categorical, TimeSVD
+        elif self.time == 'cat':  # categorical; TimeSVD
             max_col_idx = max(
                 np.concatenate((test.cid.values, train.cid.values)))
             def write_libfm_data(f, data):
@@ -500,15 +501,112 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         else:
             write_libfm_data = write_libfm
 
-        # write the train/test data
-        with self.output()['train'].open('w') as f:
-            write_libfm_data(f, train)
+        return write_libfm_data
 
-        with self.output()['test'].open('w') as f:
-            write_libfm_data(f, test)
+    def prep_data(self):
+        """libFM has no notion of columns. It simply takes feature vectors with
+        labels. So we need to re-encode the columns by adding the max row index.
+        """
+        train, test = self.split_data()
+        max_row_idx = max(np.concatenate((test.sid.values, train.sid.values)))
+        train.cid += max_row_idx
+        test.cid += max_row_idx
+        return (train, test)
+
+    def run(self):
+        train, test = self.prep_data()
+
+        # Determine what to do with time
+        write_libfm_data = self.multiplex_time(train, test)
+
+        # write the train/test data
+        names = ['train', 'test']
+        datasets = [train, test]
+        for name, dataset in zip(names, datasets):
+            with self.output()[name].open('w') as f:
+                write_libfm_data(f, dataset)
+
+
+class UCGLibFMByTerm(UserCourseGradeLibFM):
+    """Write UCG data for term-by-term evaluation."""
+
+    base = 'tmp'
+
+    def __init__(self, *args, **kwargs):
+        super(UserCourseGradeLibFM, self).__init__(*args, **kwargs)
+        if self.time:
+            self.suffix = 'T%s' % self.time
+
+        self.train, self.test = self.prep_data()
+        # Due to the backfilling, we must rely on the train filters to get the
+        # last term in the training data.
+        start = max([f.cohort_end for f in self.filters])
+        end = int(self.test.cohort.max())
+        self.term_range = range(start + 1, end + 1)
+
+    def output(self):
+        """The filenames are written in such a way that the train/test
+        sub-extensions have the number of the term the split should be used to
+        predict. So if the sub-extensions are train5/test5, this split should be
+        used to predict the grades for termnum 5.
+
+        """
+        fname = self.output_base_fname()
+        fmt = '%s%d'
+        outputs = []
+
+        for termnum in self.term_range:  # don't write files for last num
+            train = fmt % ('train', termnum)
+            test = fmt % ('test', termnum)
+            outputs.append({
+                train: luigi.LocalTarget(fname % train),
+                test: luigi.LocalTarget(fname % test)
+            })
+        return outputs
+
+    def transfer_term(self, termnum):
+        """Move data for the given term from the test set to the train set."""
+        tomove_mask = self.test.termnum == termnum
+        self.train = pd.concat((self.train, self.test[tomove_mask]))
+        self.test = self.test[~tomove_mask]
+
+    def run(self):
+        """Now the idea here is that the task at hand is predicting the grades
+        for the next term. At the time we do this, we have the data available
+        for all previous terms. Hence, we would like to output the initial
+        train/test specified by the user, as usual. But then we also want to
+        output another train/test set for each subsequent term.
+
+        So if the user specifies 0-7, the first train set will have 0-7, and
+        the test set will have 8-14. Then we'll output another 6 splits. For
+        each new split, we find the max term number currently in the test set
+        and transfer the term after that one from the test set to the train
+        set. We continue until the test set includes only the last term.
+
+        """
+        train, test = self.train, self.test
+
+        # Determine what to do with time
+        write_libfm_data = self.multiplex_time(train, test)
+
+        # prep for data output
+        outnum = -1
+        outputs = self.output()
+        names = ['train%d', 'test%d']
+
+        # write all data files
+        for termnum in self.term_range:  # includes (end term + 1)
+            outnum += 1
+            outnames = [n % termnum for n in names]
+            for name, dataset in zip(outnames, [self.train, self.test]):
+                with outputs[outnum][name].open('w') as f:
+                    write_libfm_data(f, dataset)
+            self.transfer_term(termnum)  # modify train/test sets in place
+            # intentionally skip writing the last time this is run
 
 
 class RunLibFM(UserCourseGradeLibFM):
+    """General-purpose wrapper that spawns a subprocess to run libFM."""
     iterations = luigi.IntParameter(
         default=100,
         description='number of iterations to use for learning')
