@@ -544,16 +544,14 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
 
         """
         fname = self.output_base_fname()
-        fmt = '%s%d'
-        outputs = []
-
+        outputs = {}
         for termnum in self.term_range:  # don't write files for last num
-            train = fmt % ('train', termnum)
-            test = fmt % ('test', termnum)
-            outputs.append({
-                train: luigi.LocalTarget(fname % train),
-                test: luigi.LocalTarget(fname % test)
-            })
+            train = '%s%d' % ('train', termnum)
+            test = '%s%d' % ('test', termnum)
+            outputs[termnum] = {
+                'train': luigi.LocalTarget(fname % train),
+                'test': luigi.LocalTarget(fname % test)
+            }
         return outputs
 
     def transfer_term(self, termnum):
@@ -581,18 +579,12 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
         # Determine what to do with time
         write_libfm_data = self.multiplex_time(train, test)
 
-        # prep for data output
-        outnum = -1
-        outputs = self.output()
-        names = ['train%d', 'test%d']
-
         # write all data files
+        outputs = self.output()
         for termnum in self.term_range:  # includes (end term + 1)
-            outnum += 1
-            outnames = [n % termnum for n in names]
             test = self.test[self.test.termnum == termnum]
-            for name, dataset in zip(outnames, [self.train, test]):
-                with outputs[outnum][name].open('w') as f:
+            for name, dataset in zip(['train', 'test'], [self.train, test]):
+                with outputs[termnum][name].open('w') as f:
                     write_libfm_data(f, dataset)
             self.transfer_term(termnum)  # modify train/test sets in place
             # intentionally skip writing the last time this is run
@@ -618,8 +610,10 @@ class UsesLibFM(luigi.Task):
         default=5,
         description='start of dimension range to produce results for')
     dim_end = luigi.IntParameter(
-        default=20,
+        default=10,
         description='end of dimension range to produce results for, inclusive')
+
+    prefix = ''
 
     @property
     def libfm_arg_indicators(self):
@@ -645,28 +639,35 @@ class UsesLibFM(luigi.Task):
 
     @property
     def libfm_command(self):
-        def show_libfm_command(train_fname, test_fname):
+        def show_libfm_command(train_fname, test_fname, outfile=''):
             return ' '.join(test_params.compose_libfm_args(
                 train_fname, test_fname, self.iterations,
-                dim=self.dim_start,
-                std=self.init_stdev,
-                bias=self.use_bias))
+                dim=self.dim_start, std=self.init_stdev,
+                bias=self.use_bias, outfile=outfile))
         return show_libfm_command
 
     @property
     def run_libfm(self):
-        def run_libfm(train_fname, test_fname):
+        def run_libfm(train_fname, test_fname, outfile=''):
+            return test_params.run_libfm(
+                train_fname, test_fname,
+                iter=self.iterations, std=self.init_stdev,
+                dim=self.dim_start, bias=self.use_bias, outfile=outfile)
+        return run_libfm
+
+    @property
+    def run_libfm_ndim(self):
+        def run_libfm(train_fname, test_fname, outfile=''):
             return test_params.test_dim(
                 self.dim_start, self.dim_end,
                 train_fname, test_fname, self.iterations,
-                std=self.init_stdev, bias=self.use_bias)
+                std=self.init_stdev, bias=self.use_bias, outfile=outfile)
         return run_libfm
 
 
 class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
     """General-purpose wrapper that spawns a subprocess to run libFM."""
 
-    prefix = ''
     base = 'outcomes'
     ext = 'tsv'
 
@@ -685,7 +686,7 @@ class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
 
     def run(self):
         inputs = self.input()
-        results = self.run_libfm(
+        results = self.run_libfm_ndim(
             inputs['train'].path,
             inputs['test'].path
         )
@@ -693,6 +694,79 @@ class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
         with self.output().open('w') as f:
             output = '\n'.join(['\t'.join(result) for result in results])
             f.write(output)
+
+
+class RunLibFMByTerm(UsesLibFM, UCGLibFMByTerm):
+    """Run libFM on prediction task, evaluating term by term."""
+
+    # note that only dim_start is used; fixed dimension
+
+    base = 'outcomes'
+    ext = 'pred'
+
+    def __init__(self, *args, **kwargs):
+        super(UCGLibFMByTerm, self).__init__(*args, **kwargs)
+        task_params = [tup[0] for tup in UCGLibFMByTerm.get_params()]
+        params = {k:v for k, v in self.param_kwargs.items()
+                  if k in task_params}
+        self.task = UCGLibFMByTerm(**params)
+
+    def requires(self):
+        return self.task
+
+    def output(self):
+        """The outputs will actually be predictions from libFM."""
+        parts = self.libfm_arg_indicators
+        self.suffix = '-'.join(parts)
+        base_fname = self.output_base_fname()
+        subext = '{}.t%d'.format(self.__class__.__name__)
+
+        return {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
+                for termnum in self.task.term_range}
+
+    def run(self):
+        """No need to write anything; simply pass output filenames to libFM."""
+        inputs = self.input()
+        outputs = self.output()
+        for termnum in inputs:
+            train = inputs[termnum]['train'].path
+            test = inputs[termnum]['test'].path
+            outfile = outputs[termnum].path
+            self.run_libfm(train, test, outfile)
+
+
+class EvalResultsByTerm(RunLibFMByTerm):
+
+    def requires(self):
+        return {
+            'in': self.task,
+            'predict': RunLibFMByTerm(**self.param_kwargs)
+        )
+
+    def output(self):
+        # TODO: output term-by-term RMSE and total RMSE
+        pass
+
+    def run(self):
+        inputs = self.input()
+        error = []
+        for termnum in inputs:
+            testfile = inputs['in'][termnum]['test']
+            predict_file = inputs['predict'][termnum]
+
+            with testfile.open() as f:
+                test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
+
+            with predict_file.open() as f:
+                predicted = pd.read_csv(f, header=None)
+
+            error.append(abs(test - predict))
+
+        all_error = pd.concat(error)
+        mse = ((all_error ** 2).sum() / len(all_error)).values[0]
+        rmse = np.sqrt(mse)  # RMSE for full dataset
+
+        # TODO: also compute for each term individually
 
 
 class SVD(RunLibFM):

@@ -8,14 +8,16 @@ LIBFM = 'libfm-1.42.src/bin/libFM'
 
 
 def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
-                       bin=LIBFM):
+                       outfile='', bin=LIBFM):
     """Put together libFM args in a list suitable for use with Popen.
 
-    :param str train: Path for training data file, in libFM format.
-    :param str test:  Path for test data file, in libFM format.
-    :param int iter:  Number of iterations to run learning algorithm for.
-    :param int dim:   Dimensionality of low-rank approximation to use.
-    :return: List of args to use for running libFM.
+    :param str train:   Path for training data file, in libFM format.
+    :param str test:    Path for test data file, in libFM format.
+    :param int iter:    Number of iterations to run learning algorithm for.
+    :param int dim:     Dimensionality of low-rank approximation to use.
+    :param bool bias:   Use global and per-feature bias terms.
+    :param str outfile: Output predictions to a file with this name.
+    :return:            List of args to use for running libFM.
 
     """
     bias = int(bias)
@@ -28,18 +30,24 @@ def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
         '-dim', '%d,%d,%d' % (bias, bias, dim),
         '-init_stdev', str(std)
     ]
+    if outfile:
+        args.append('-out')
+        args.append(outfile)
     return args
 
 
 def run_libfm(train, test, iter=20, std=0.2, dim=8, bias=False,
-              bin=LIBFM):
+              outfile=''):
     """Run libFM and return final train/test results.
 
     :return: Final error for (train, test) sets.
     """
-    args = compose_libfm_args(train, test, iter, std, dim, bias, bin)
-    logging.debug(' '.join(args))
-    proc = sub.Popen(args, stdout=sub.PIPE)
+    kwargs = {k: v for k, v in locals().items() if not k in ['train', 'test']}
+    args = compose_libfm_args(train, test, **kwargs)
+    cmd = ' '.join(args)
+    logging.debug(cmd)
+
+    proc = sub.Popen(cmd, shell=True, stdout=sub.PIPE)
     output = proc.communicate()[0]
     lines = output.split('\n')
     rows = [row.split('\t')[1:] for row in lines[-iter:] if row]
