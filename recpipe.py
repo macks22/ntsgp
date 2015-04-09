@@ -422,14 +422,10 @@ class UserCourseGradeTriples(DataSplitterBaseTask):
     """Produce a User x Course matrix with quality points as entries."""
 
     def run(self):
-        train, test = self.split_data()
-
-        # write the train/test data
-        with self.output()['train'].open('w') as f:
-            write_triples(f, train)
-
-        with self.output()['test'].open('w') as f:
-            write_triples(f, test)
+        """Write the train/test data in triple format."""
+        for name, dataset in zip(['train', 'test'], self.split_data()):
+            with self.output()[name].open('w') as f:
+                write_triples(f, dataset)
 
 
 def write_libfm(f, data, userid='sid', itemid='cid', rating='grdpts',
@@ -478,7 +474,7 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         if self.time:
             self.suffix = 'T%s' % self.time
 
-    def multiplex_time(self, train, test):
+    def write_libfm_data(self, train, test):
         """If time is included, as a feature, we need to specify how it will be
         written in the libFM format. The method being emulated changes based on
         how we choose to encode it. We multiplex based on time in the sense that
@@ -520,9 +516,7 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         write_libfm_data = self.multiplex_time(train, test)
 
         # write the train/test data
-        names = ['train', 'test']
-        datasets = [train, test]
-        for name, dataset in zip(names, datasets):
+        for name, dataset in zip(['train', 'test'], [train, test]):
             with self.output()[name].open('w') as f:
                 write_libfm_data(f, dataset)
 
@@ -533,11 +527,9 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
     base = 'tmp'
 
     def __init__(self, *args, **kwargs):
-        super(UserCourseGradeLibFM, self).__init__(*args, **kwargs)
-        if self.time:
-            self.suffix = 'T%s' % self.time
-
+        super(UCGLibFMByTerm, self).__init__(*args, **kwargs)
         self.train, self.test = self.prep_data()
+
         # Due to the backfilling, we must rely on the train filters to get the
         # last term in the training data.
         start = max([f.cohort_end for f in self.filters])
@@ -598,15 +590,21 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
         for termnum in self.term_range:  # includes (end term + 1)
             outnum += 1
             outnames = [n % termnum for n in names]
-            for name, dataset in zip(outnames, [self.train, self.test]):
+            test = self.test[self.test.termnum == termnum]
+            for name, dataset in zip(outnames, [self.train, test]):
                 with outputs[outnum][name].open('w') as f:
                     write_libfm_data(f, dataset)
             self.transfer_term(termnum)  # modify train/test sets in place
             # intentionally skip writing the last time this is run
 
+        # TODO: this code converts the same records to libFM format multiple
+        # times. Each subsequent train set contains records in the last train
+        # set. These could be cached to avoid all of the string format
+        # conversion overhead.
 
-class RunLibFM(UserCourseGradeLibFM):
-    """General-purpose wrapper that spawns a subprocess to run libFM."""
+
+class UsesLibFM(luigi.Task):
+    """Base class for any class that uses libFM to produce results."""
     iterations = luigi.IntParameter(
         default=100,
         description='number of iterations to use for learning')
@@ -623,22 +621,14 @@ class RunLibFM(UserCourseGradeLibFM):
         default=20,
         description='end of dimension range to produce results for, inclusive')
 
-    prefix = ''
-    base = 'outcomes'
-    ext = 'tsv'
-
-    def requires(self):
-        task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
-        params = {k:v for k, v in self.param_kwargs.items()
-                  if k in task_params}
-        return UserCourseGradeLibFM(**params)
-
-    def output(self):
+    @property
+    def libfm_arg_indicators(self):
         parts = []
 
         # time information part
-        if self.time:
-            parts.append('T%s' % self.time)
+        time = getattr(self, 'time', '')
+        if time:
+            parts.append('T%s' % time)
 
         # number of iterations part
         parts.append('i%d' % self.iterations)
@@ -651,19 +641,54 @@ class RunLibFM(UserCourseGradeLibFM):
         if self.use_bias:
             parts.append('b')
 
+        return parts
+
+    @property
+    def libfm_command(self):
+        def show_libfm_command(train_fname, test_fname):
+            return ' '.join(test_params.compose_libfm_args(
+                train_fname, test_fname, self.iterations,
+                dim=self.dim_start,
+                std=self.init_stdev,
+                bias=self.use_bias))
+        return show_libfm_command
+
+    @property
+    def run_libfm(self):
+        def run_libfm(train_fname, test_fname):
+            return test_params.test_dim(
+                self.dim_start, self.dim_end,
+                train_fname, test_fname, self.iterations,
+                std=self.init_stdev, bias=self.use_bias)
+        return run_libfm
+
+
+class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
+    """General-purpose wrapper that spawns a subprocess to run libFM."""
+
+    prefix = ''
+    base = 'outcomes'
+    ext = 'tsv'
+
+    def requires(self):
+        task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
+        params = {k:v for k, v in self.param_kwargs.items()
+                  if k in task_params}
+        return UserCourseGradeLibFM(**params)
+
+    def output(self):
+        parts = self.libfm_arg_indicators
         self.suffix = '-'.join(parts)
         base_fname = self.output_base_fname()
         fname = base_fname % self.__class__.__name__
         return luigi.LocalTarget(fname)
 
     def run(self):
-        train = self.input()['train'].path
-        test = self.input()['test'].path
-
-        results = test_params.test_dim(
-            self.dim_start, self.dim_end,
-            train, test, self.iterations,
-            std=self.init_stdev, bias=self.use_bias)
+        inputs = self.input()
+        results = self.run_libfm(
+            inputs['train'].path,
+            inputs['test'].path
+        )
 
         with self.output().open('w') as f:
             output = '\n'.join(['\t'.join(result) for result in results])

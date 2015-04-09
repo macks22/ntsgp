@@ -7,6 +7,68 @@ import logging
 LIBFM = 'libfm-1.42.src/bin/libFM'
 
 
+def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
+                       bin=LIBFM):
+    """Put together libFM args in a list suitable for use with Popen.
+
+    :param str train: Path for training data file, in libFM format.
+    :param str test:  Path for test data file, in libFM format.
+    :param int iter:  Number of iterations to run learning algorithm for.
+    :param int dim:   Dimensionality of low-rank approximation to use.
+    :return: List of args to use for running libFM.
+
+    """
+    bias = int(bias)
+    args = [
+        bin,
+        '-task', 'r',
+        '-train', train,
+        '-test', test,
+        '-iter', str(iter),
+        '-dim', '%d,%d,%d' % (bias, bias, dim),
+        '-init_stdev', str(std)
+    ]
+    return args
+
+
+def run_libfm(train, test, iter=20, std=0.2, dim=8, bias=False,
+              bin=LIBFM):
+    """Run libFM and return final train/test results.
+
+    :return: Final error for (train, test) sets.
+    """
+    args = compose_libfm_args(train, test, iter, std, dim, bias, bin)
+    logging.debug(' '.join(args))
+    proc = sub.Popen(args, stdout=sub.PIPE)
+    output = proc.communicate()[0]
+    lines = output.split('\n')
+    rows = [row.split('\t')[1:] for row in lines[-iter:] if row]
+    train_err = '%.6f' % float(rows[-1][0].split('=')[1])
+    test_err = '%.6f' % float(rows[-1][1].split('=')[1])
+    return [train_err, test_err]
+
+
+def test_dim(start, end, *args, **kwargs):
+    """Run libFM regression once for each dimension value in range(start, end+1).
+    See `run_libfm` for *args and **kwargs.
+
+    :param int start: The first dimension in the range.
+    :param int end: The last dimension in the range (inclusive).
+    :return: List of (dim, train_err, test_err) for all dimensions tested.
+    """
+    results = []
+    for dim in range(start, end+1):
+        out = run_libfm(*args, dim=dim, **kwargs)
+        out.insert(0, str(dim))
+        logging.info('\t'.join(out))
+        results.append(out)
+
+    top = list(sorted(results, key=lambda l: l[2]))
+    top5 = [t[0] for t in top[:5]]
+    logging.info('best results with dim=%s' % ','.join(map(str, top5)))
+    return results
+
+
 def make_parser():
     parser = argparse.ArgumentParser(
         description='try out various libFM params to fine-tune')
@@ -35,57 +97,6 @@ def make_parser():
         help='path for test file, in libFM format')
 
     return parser
-
-
-def run_libfm(train, test, iter, std=0.2, dim=8, bias=False, bin=LIBFM):
-    """Run libFM and return final train/test results.
-
-    :param str train: Path for training data file, in libFM format.
-    :param str test:  Path for test data file, in libFM format.
-    :param int iter:  Number of iterations to run learning algorithm for.
-    :param int dim:   Dimensionality of low-rank approximation to use.
-    :rtype:  (float, float)
-    :return: Final error for (train, test) sets.
-    """
-    bias = int(bias)
-    args = [
-        bin,
-        '-task', 'r',
-        '-train', train,
-        '-test', test,
-        '-iter', str(iter),
-        '-dim', '%d,%d,%d' % (bias, bias, dim),
-        '-init_stdev', str(std)
-    ]
-    logging.debug(' '.join(args))
-    proc = sub.Popen(args, stdout=sub.PIPE)
-    output = proc.communicate()[0]
-    lines = output.split('\n')
-    rows = [row.split('\t')[1:] for row in lines[-iter:] if row]
-    train_err = rows[-1][0].split('=')[1]
-    test_err = rows[-1][1].split('=')[1]
-    return [train_err, test_err]
-
-
-def test_dim(start, end, *args, **kwargs):
-    """Run libFM regression once for each dimension value in range(start, end+1).
-    See `run_libfm` for *args and **kwargs.
-
-    :param int start: The first dimension in the range.
-    :param int end: The last dimension in the range (inclusive).
-    :return: List of (dim, train_err, test_err) for all dimensions tested.
-    """
-    results = []
-    for dim in range(start, end+1):
-        out = run_libfm(*args, dim=dim, **kwargs)
-        out.insert(0, str(dim))
-        logging.info('\t'.join(out))
-        results.append(out)
-
-    top = list(sorted(results, key=lambda l: l[2]))
-    top5 = [t[0] for t in top[:5]]
-    logging.info('best results with dim=%s' % ','.join(map(str, top5)))
-    return results
 
 
 if __name__ == "__main__":
