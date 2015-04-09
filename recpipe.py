@@ -471,7 +471,7 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
     def __init__(self, *args, **kwargs):
         super(UserCourseGradeLibFM, self).__init__(*args, **kwargs)
         if self.time:
-            self.suffix = 'time-%s' % self.time
+            self.suffix = 'T%s' % self.time
 
     def run(self):
         train, test = self.split_data()
@@ -513,7 +513,7 @@ class RunLibFM(UserCourseGradeLibFM):
         default=100,
         description='number of iterations to use for learning')
     init_stdev = luigi.FloatParameter(
-        default=0.3,
+        default=0.5,
         description='initial std of Gaussian spread; higher can be faster')
     use_bias = luigi.BoolParameter(
         default=False,
@@ -525,6 +525,7 @@ class RunLibFM(UserCourseGradeLibFM):
         default=20,
         description='end of dimension range to produce results for, inclusive')
 
+    prefix = ''
     base = 'outcomes'
     ext = 'tsv'
 
@@ -539,7 +540,7 @@ class RunLibFM(UserCourseGradeLibFM):
 
         # time information part
         if self.time:
-            parts.append('time-%s' % self.time)
+            parts.append('T%s' % self.time)
 
         # number of iterations part
         parts.append('i%d' % self.iterations)
@@ -619,11 +620,15 @@ class RunAllOnSplit(RunLibFM):
         return [luigi.LocalTarget(f.path) for f in self.input()]
 
     def extract_method_name(self, outfile):
-        return os.path.basename(outfile).split('-')[0]
+        base = os.path.splitext(outfile)[0]
+        method = os.path.splitext(base)[1].strip('.')
+        return method
 
     @property
     def method_names(self):
         return [self.extract_method_name(f.path) for f in self.input()]
+
+    run = luigi.Task.run  # reset to default
 
 
 class CompareMethods(RunAllOnSplit):
@@ -634,10 +639,22 @@ class CompareMethods(RunAllOnSplit):
 
     base = 'outcomes'
     ext = 'tsv'
-    prefix = 'compare'
+    suffix = ''
 
     def output(self):
+        # include indicators for arguments that are the same across all methods
+        # number of iterations part
+        parts = ['i%d' % self.iterations]
+
+        # initial standard deviation part (init_stdev)
+        std = 's%s' % ''.join(str(self.init_stdev).split('.'))
+        parts.append(std)
+
+        # combine with current suffix
+        parts.append('compare')
+        self.suffix = '-'.join(parts)
         base_fname = self.output_base_fname()
+
         fname = base_fname % 'top%d' % self.topn
         return luigi.LocalTarget(fname)
 
@@ -727,11 +744,38 @@ class ResultsMarkdownTable(CompareMethods):
 class RunAll(luigi.Task):
     """Run all available methods on 0-4 and 0-7 train/test splits."""
 
-    splits = ["0-4", "0-7"]
+    # The splits divide the data into these proportions (train | test)
+    # ----------------------------------------------------------------
+    # 0-1  (2009-2009): .282 | .718
+    # 0-4  (2009-2010): .542 | .458
+    # 0-7  (2009-2011): .758 | .242
+    # 0-10 (2009-2012): .910 | .240
 
+    splits = ["0-1", "0-4", "0-7", "0-10"]  # 4 splits
+    backfills = [0, 1, 2, 3, 4, 5]  # 6 backfill settings
+
+    @property
+    def num_method_runs(self):
+        """How many times libFM is run."""
+        task = RunAllOnSplit(train_filters=self.splits[0])
+        num_methods = len(task.deps())
+        return num_methods * len(self.splits) * len(self.backfills)
+
+    @property
+    def num_iterations(self):
+        """The total number of iterations libFM is run over all methods."""
+        task = RunAllOnSplit(train_filters=self.splits[0])
+        dim_range = task.dim_end - task.dim_start
+        return task.iterations * dim_range * self.complexity
+
+    # TODO: extend this to actually perform comparison between results
     def requires(self):
         for split in self.splits:
-            yield ResultsMarkdownTable(train_filters=split)
+            for backfill in self.backfills:
+                yield ResultsMarkdownTable(
+                    train_filters=split,
+                    backfill_cold_students=backfill,
+                    backfill_cold_courses=backfill)
 
 
 if __name__ == "__main__":
