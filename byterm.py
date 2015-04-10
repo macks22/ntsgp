@@ -15,10 +15,8 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
 
     @property
     def train(self):
-        try:
-            return self._train
-        except:
-            self._train, self._test = self.prep_data()
+        try: return self._train
+        except: self._train, self._test = self.prep_data()
         return self._train
 
     @train.setter
@@ -27,10 +25,8 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
 
     @property
     def test(self):
-        try:
-            return self._test
-        except:
-            self._train, self._test = self.prep_data()
+        try: return self._test
+        except: self._train, self._test = self.prep_data()
         return self._test
 
     @test.setter
@@ -42,7 +38,7 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
         # Due to the backfilling, we must rely on the train filters to get the
         # last term in the training data.
         start = max([f.cohort_end for f in self.filters])
-        end = int(self.test.cohort.max())
+        end = int(self.test[~self.test.cohort.isnull()].cohort.max())
         return range(start + 1, end + 1)
 
     def output(self):
@@ -119,8 +115,6 @@ class RunLibFMByTerm(UsesLibFM, UsesTrainTestSplit):
 
         task_params = [tup[0] for tup in UCGLibFMByTerm.get_params()]
         kwargs = self.param_kwargs
-        # kwargs['time'] = getattr(self, 'time', '')
-        # kwargs['use_bias'] = getattr(self, 'use_bias', False)
         params = {k:v for k, v in kwargs.items() if k in task_params}
         self._task = UCGLibFMByTerm(**params)
         return self._task
@@ -135,8 +129,14 @@ class RunLibFMByTerm(UsesLibFM, UsesTrainTestSplit):
         base_fname = self.output_base_fname()
         subext = '{}.t%d'.format(self.__class__.__name__)
 
-        return {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
-                for termnum in self.task.term_range}
+        outputs = {}
+        inputs = self.input()
+        for termnum in self.task.term_range:
+            outputs[termnum] = {
+                'test': luigi.LocalTarget(inputs[termnum]['test'].path),
+                'predict': luigi.LocalTarget(base_fname % (subext % termnum))
+            }
+        return outputs
 
     def run(self):
         """No need to write anything; simply pass output filenames to libFM."""
@@ -145,102 +145,57 @@ class RunLibFMByTerm(UsesLibFM, UsesTrainTestSplit):
         for termnum in inputs:
             train = inputs[termnum]['train'].path
             test = inputs[termnum]['test'].path
-            outfile = outputs[termnum].path
+            outfile = outputs[termnum]['predict'].path
             self.run_libfm(train, test, outfile)
 
 
-class EvalResultsByTerm(RunLibFMByTerm):
-    """Calculate RMSE for each term and over all terms."""
-
-    ext = 'tsv'
-
-    def requires(self):
-        # TODO: error coming from here
-        return {
-            'in': self.task,  # comes from inherited __init__
-            'predict': RunLibFMByTerm(**self.param_kwargs)
-        }
-
-    def output(self):
-        parts = self.libfm_arg_indicators
-        self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
-        fname = base_fname % self.__class__.__name__
-        return luigi.LocalTarget(fname)
-
-    def rmse(self, error):
-        mse = ((error ** 2).sum() / len(error)).values[0]
-        return np.sqrt(mse)
-
-    def run(self):
-        inputs = self.input()
-        error_by_term = OrderedDict()
-        for termnum in inputs['in']:
-            testfile = inputs['in'][termnum]['test']
-            predict_file = inputs['predict'][termnum]
-
-            with testfile.open() as f:
-                test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
-
-            with predict_file.open() as f:
-                predicted = pd.read_csv(f, header=None)
-
-            # calculate absolute deviation from actual prediction
-            error_by_term[termnum] = abs(test - predicted)
-
-        # compute rmse by term and over all terms
-        all_error = pd.concat(error_by_term.values())
-        total_rmse = self.rmse(all_error)
-        term_rmses = [self.rmse(error) for error in error_by_term.values()]
-        rmse_vals = ['%.5f' % val for val in [total_rmse] + term_rmses]
-
-        # write all error calculations
-        header = ['all'] + ['term%d' % tnum for tnum in error_by_term.keys()]
-        with self.output().open('w') as f:
-            f.write('\t'.join(header) + '\n')
-            f.write('\t'.join(rmse_vals))
+# For some reason, setting these attributes as plain old class level variables
+# doesn't work. So instead we simply change the defaults. This is an odd
+# implementation however, because it lets users run these methods with other
+# settings for these parameters, which actually makes libFM emulate other
+# methods. This is not good, but it works for now since I'm the only user.
 
 
-class SVDByTerm(EvalResultsByTerm):
+class SVDByTerm(RunLibFMByTerm):
     """Run libFm to emulate SVD for term-by-term prediction."""
-    use_bias = False
-    time = ''
+    pass
 
 class BiasedSVDByTerm(SVDByTerm):
     """Run libFM to emulate biased SVD for term-by-term prediction."""
-    use_bias = True
+    use_bias = luigi.BoolParameter(default=True)
 
 class TimeSVDByTerm(SVDByTerm):
     """Run libFM to emulate TimeSVD for term-by-term prediction."""
-    time = 'cat'
+    time = luigi.Parameter(default='cat')
 
 class BiasedTimeSVDByTerm(TimeSVDByTerm):
     """Run libFM to emulate biased TimeSVD for term-by-term prediction."""
-    use_bias = True
+    use_bias = luigi.BoolParameter(default=True)
 
-class BPTFByTerm(EvalResultsByTerm):
+class BPTFByTerm(RunLibFMByTerm):
     """Run libFM to emulate BPTF for term-by-term prediction."""
-    use_bias = False
-    time = 'bin'
+    time = luigi.Parameter(default='bin')
 
 class BiasedBPTFByTerm(BPTFByTerm):
     """Run libFM to emulate biased BPTF for term-by-term prediction."""
-    use_bias = True
+    use_bias = luigi.BoolParameter(default=True)
 
 
-class RunAllOnSplitByTerm(EvalResultsByTerm):
+class RunAllOnSplitByTerm(RunLibFMByTerm):
     """Run all available methods via libFM for a particular train/test split."""
     train_filters = luigi.Parameter(  # restate to make non-optional
         description='Specify how to split the train set from the test set.')
     time = ''     # disable parameter
     use_bias = '' # disable parameter
+    ext = 'err.tsv'
 
     def requires(self):
+        # filter out disabled parameters
         kwargs = self.param_kwargs
-        # if 'time' in kwargs:
-        #     del kwargs['time']
-        # if 'use_bias' in kwargs:
-        #     del kwargs['use_bias']
+        for attr in ['time', 'use_bias']:
+            if attr in kwargs:
+                del kwargs[attr]
+
         return [
             SVDByTerm(**kwargs),
             BiasedSVDByTerm(**kwargs),
@@ -250,22 +205,79 @@ class RunAllOnSplitByTerm(EvalResultsByTerm):
             BiasedBPTFByTerm(**kwargs)
         ]
 
-    def output(self):
-        return [luigi.LocalTarget(f.path) for f in self.input()]
+    def _iter_input_basenames(self):
+        for method in self.input():
+            first_fname = method.values()[0]['predict'].path
+            sub = os.path.splitext(first_fname)[0]
+            yield os.path.splitext(sub)[0]
 
-    def extract_method_name(self, outfile):
-        base = os.path.splitext(outfile)[0]
+    def output(self):
+        return self.input()
+
+    def extract_method_name(self, base):
         method = os.path.splitext(base)[1].strip('.')
         return method.replace('ByTerm', '')
 
     @property
     def method_names(self):
-        return [self.extract_method_name(f.path) for f in self.input()]
+        return [self.extract_method_name(base)
+                for base in self._iter_input_basenames()]
 
     run = luigi.Task.run  # reset to default
 
 
-class CompareMethodsByTerm(RunAllOnSplitByTerm):
+class EvalResultsByTerm(RunAllOnSplitByTerm):
+    """Calculate RMSE for each term and over all terms."""
+
+    ext = 'tsv'
+
+    def requires(self):
+        task_params = [tup[0] for tup in RunAllOnSplitByTerm.get_params()]
+        kwargs = self.param_kwargs
+        params = {k:v for k, v in kwargs.items() if k in task_params}
+        return RunAllOnSplitByTerm(**params)
+
+    def output(self):
+        outputs = []
+        for base in self._iter_input_basenames():
+            fname = '%s.%s' % (base, self.ext)
+            outputs.append(luigi.LocalTarget(fname))
+        return outputs
+
+    def rmse(self, error):
+        mse = ((error ** 2).sum() / len(error)).values[0]
+        return np.sqrt(mse)
+
+    def run(self):
+        for method, outfile in zip(self.input(), self.output()):
+            error_by_term = OrderedDict()
+            for termnum in method:
+                testfile = method[termnum]['test']
+                predict_file = method[termnum]['predict']
+
+                with testfile.open() as f:
+                    test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
+
+                with predict_file.open() as f:
+                    predicted = pd.read_csv(f, header=None)
+
+                # calculate absolute deviation from actual prediction
+                error_by_term[termnum] = abs(test - predicted)
+
+            # compute rmse by term and over all terms
+            all_error = pd.concat(error_by_term.values())
+            total_rmse = self.rmse(all_error)
+            term_rmses = [self.rmse(error) for error in error_by_term.values()]
+            rmse_vals = ['%.5f' % val for val in [total_rmse] + term_rmses]
+
+            # write all error calculations
+            header = ['all'] + ['term%d' % tnum for tnum in error_by_term.keys()]
+            with outfile.open('w') as f:
+                f.write('\t'.join(header) + '\n')
+                f.write('\t'.join(rmse_vals))
+
+
+class CompareMethodsByTerm(EvalResultsByTerm):
     """Aggregate results from all available methods on a particular split."""
 
     base = 'outcomes'
@@ -280,7 +292,10 @@ class CompareMethodsByTerm(RunAllOnSplitByTerm):
         return luigi.LocalTarget(fname)
 
     def requires(self):
-        return RunAllOnSplitByTerm(train_filters=self.train_filters)
+        task_params = [tup[0] for tup in EvalResultsByTerm.get_params()]
+        kwargs = self.param_kwargs
+        params = {k:v for k, v in kwargs.items() if k in task_params}
+        return EvalResultsByTerm(**params)
 
     def read_results(self, f):
         headers = f.readline()
@@ -300,7 +315,8 @@ class CompareMethodsByTerm(RunAllOnSplitByTerm):
                 errors = self.read_results(f)
 
             # add method name to each result for this method
-            method_name = self.extract_method_name(input.path)
+            base = os.path.splitext(input.path)[0]
+            method_name = self.extract_method_name(base)
             errors.insert(0, method_name)
             results.append(errors)
 
@@ -309,6 +325,58 @@ class CompareMethodsByTerm(RunAllOnSplitByTerm):
         with self.output().open('w') as f:
             f.write('\t'.join(self.header) + '\n')
             f.write('\n'.join(['\t'.join(map(str, row)) for row in top]))
+
+
+class ResultsMarkdownTableByTerm(CompareMethodsByTerm):
+    """Produce markdown table of results comparison for a data split."""
+    precision = luigi.IntParameter(
+        default=5,
+        description='number of decimal places to keep for error measurements')
+
+    def requires(self):
+        kwargs = self.param_kwargs.copy()
+        del kwargs['precision']
+        return CompareMethodsByTerm(**kwargs)
+
+    def output(self):
+        outname = self.input().path
+        base = os.path.splitext(outname)[0]
+        return luigi.LocalTarget('%s.md' % base)
+
+    def read_results(self, f):
+        header = f.readline().strip().split('\t')
+        content = f.read()
+        rows = [l.split('\t') for l in content.split('\n')]
+        fmt = '%.{}f'.format(self.precision)
+        for row in rows:
+            for num in range(1, len(row)):
+                row[num] = fmt % float(row[num])
+        return header, rows
+
+    def run(self):
+        with self.input().open() as f:
+            header, rows = self.read_results(f)
+
+        # results are already sorted; we simply need to format them as a
+        # markdown table; first find the column widths, leaving a bit of margin
+        # space for readability
+        widths = np.array([[len(item) for item in row]
+                           for row in rows + header]).max(axis=0)
+        margin = 4
+        colwidths = np.array(widths) + margin
+        underlines = ['-' * width for width in widths]
+
+        # next, justify the columns appropriately
+        def format_row(row):
+            return [row[0].ljust(colwidths[0])] + \
+                   [row[i].rjust(colwidths[i]) for i in range(1, len(row))]
+
+        output = [format_row(header), format_row(underlines)]
+        output += [format_row(row) for row in rows]
+
+        # finally, write the table
+        with self.output().open('w') as f:
+            f.write('\n'.join([''.join(row) for row in output]))
 
 
 if __name__ == "__main__":

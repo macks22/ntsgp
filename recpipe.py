@@ -473,7 +473,7 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         if self.time:
             self.suffix = 'T%s' % self.time
 
-    def write_libfm_data(self, train, test):
+    def multiplex_time(self, train, test):
         """If time is included, as a feature, we need to specify how it will be
         written in the libFM format. The method being emulated changes based on
         how we choose to encode it. We multiplex based on time in the sense that
@@ -483,9 +483,8 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         if self.time == 'bin':  # one-hot encoding; BPTF
             max_col_idx = max(
                 np.concatenate((test.cid.values, train.cid.values)))
-            train.termnum += max_col_idx
-            test.termnum += max_col_idx
             def write_libfm_data(f, data):
+                data.termnum += max_col_idx
                 write_libfm(f, data, timecol='termnum')
         elif self.time == 'cat':  # categorical; TimeSVD
             max_col_idx = max(
@@ -522,6 +521,11 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
 
 class UsesLibFM(luigi.Task):
     """Base class for any class that uses libFM to produce results."""
+    time = luigi.Parameter(
+        default='',
+        description='if empty; no time attributes, ' +
+                    'cat = categorical encoding (TimeSVD), ' +
+                    'bin = binary, one-hot encoding (BPTF)')
     iterations = luigi.IntParameter(
         default=100,
         description='number of iterations to use for learning')
@@ -545,9 +549,8 @@ class UsesLibFM(luigi.Task):
         parts = []
 
         # time information part
-        time = getattr(self, 'time', '')
-        if time:
-            parts.append('T%s' % time)
+        if self.time:
+            parts.append('T%s' % self.time)
 
         # number of iterations part
         parts.append('i%d' % self.iterations)
