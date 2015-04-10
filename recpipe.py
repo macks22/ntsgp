@@ -342,7 +342,6 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
         data = data[~data['grdpts'].isnull()]
         return data
 
-
     def backfill(self, train, test, key, firstn):
         """Used to prevent cold-start records.
 
@@ -521,80 +520,6 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
                 write_libfm_data(f, dataset)
 
 
-class UCGLibFMByTerm(UserCourseGradeLibFM):
-    """Write UCG data for term-by-term evaluation."""
-
-    base = 'tmp'
-
-    def __init__(self, *args, **kwargs):
-        super(UCGLibFMByTerm, self).__init__(*args, **kwargs)
-        self.train, self.test = self.prep_data()
-
-        # Due to the backfilling, we must rely on the train filters to get the
-        # last term in the training data.
-        start = max([f.cohort_end for f in self.filters])
-        end = int(self.test.cohort.max())
-        self.term_range = range(start + 1, end + 1)
-
-    def output(self):
-        """The filenames are written in such a way that the train/test
-        sub-extensions have the number of the term the split should be used to
-        predict. So if the sub-extensions are train5/test5, this split should be
-        used to predict the grades for termnum 5.
-
-        """
-        fname = self.output_base_fname()
-        outputs = {}
-        for termnum in self.term_range:  # don't write files for last num
-            train = '%s%d' % ('train', termnum)
-            test = '%s%d' % ('test', termnum)
-            outputs[termnum] = {
-                'train': luigi.LocalTarget(fname % train),
-                'test': luigi.LocalTarget(fname % test)
-            }
-        return outputs
-
-    def transfer_term(self, termnum):
-        """Move data for the given term from the test set to the train set."""
-        tomove_mask = self.test.termnum == termnum
-        self.train = pd.concat((self.train, self.test[tomove_mask]))
-        self.test = self.test[~tomove_mask]
-
-    def run(self):
-        """Now the idea here is that the task at hand is predicting the grades
-        for the next term. At the time we do this, we have the data available
-        for all previous terms. Hence, we would like to output the initial
-        train/test specified by the user, as usual. But then we also want to
-        output another train/test set for each subsequent term.
-
-        So if the user specifies 0-7, the first train set will have 0-7, and
-        the test set will have 8-14. Then we'll output another 6 splits. For
-        each new split, we find the max term number currently in the test set
-        and transfer the term after that one from the test set to the train
-        set. We continue until the test set includes only the last term.
-
-        """
-        train, test = self.train, self.test
-
-        # Determine what to do with time
-        write_libfm_data = self.multiplex_time(train, test)
-
-        # write all data files
-        outputs = self.output()
-        for termnum in self.term_range:  # includes (end term + 1)
-            test = self.test[self.test.termnum == termnum]
-            for name, dataset in zip(['train', 'test'], [self.train, test]):
-                with outputs[termnum][name].open('w') as f:
-                    write_libfm_data(f, dataset)
-            self.transfer_term(termnum)  # modify train/test sets in place
-            # intentionally skip writing the last time this is run
-
-        # TODO: this code converts the same records to libFM format multiple
-        # times. Each subsequent train set contains records in the last train
-        # set. These could be cached to avoid all of the string format
-        # conversion overhead.
-
-
 class UsesLibFM(luigi.Task):
     """Base class for any class that uses libFM to produce results."""
     iterations = luigi.IntParameter(
@@ -673,8 +598,7 @@ class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
 
     def requires(self):
         task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
-        params = {k:v for k, v in self.param_kwargs.items()
-                  if k in task_params}
+        params = {k:v for k, v in self.param_kwargs.items() if k in task_params}
         return UserCourseGradeLibFM(**params)
 
     def output(self):
@@ -694,79 +618,6 @@ class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
         with self.output().open('w') as f:
             output = '\n'.join(['\t'.join(result) for result in results])
             f.write(output)
-
-
-class RunLibFMByTerm(UsesLibFM, UCGLibFMByTerm):
-    """Run libFM on prediction task, evaluating term by term."""
-
-    # note that only dim_start is used; fixed dimension
-
-    base = 'outcomes'
-    ext = 'pred'
-
-    def __init__(self, *args, **kwargs):
-        super(UCGLibFMByTerm, self).__init__(*args, **kwargs)
-        task_params = [tup[0] for tup in UCGLibFMByTerm.get_params()]
-        params = {k:v for k, v in self.param_kwargs.items()
-                  if k in task_params}
-        self.task = UCGLibFMByTerm(**params)
-
-    def requires(self):
-        return self.task
-
-    def output(self):
-        """The outputs will actually be predictions from libFM."""
-        parts = self.libfm_arg_indicators
-        self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
-        subext = '{}.t%d'.format(self.__class__.__name__)
-
-        return {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
-                for termnum in self.task.term_range}
-
-    def run(self):
-        """No need to write anything; simply pass output filenames to libFM."""
-        inputs = self.input()
-        outputs = self.output()
-        for termnum in inputs:
-            train = inputs[termnum]['train'].path
-            test = inputs[termnum]['test'].path
-            outfile = outputs[termnum].path
-            self.run_libfm(train, test, outfile)
-
-
-class EvalResultsByTerm(RunLibFMByTerm):
-
-    def requires(self):
-        return {
-            'in': self.task,
-            'predict': RunLibFMByTerm(**self.param_kwargs)
-        )
-
-    def output(self):
-        # TODO: output term-by-term RMSE and total RMSE
-        pass
-
-    def run(self):
-        inputs = self.input()
-        error = []
-        for termnum in inputs:
-            testfile = inputs['in'][termnum]['test']
-            predict_file = inputs['predict'][termnum]
-
-            with testfile.open() as f:
-                test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
-
-            with predict_file.open() as f:
-                predicted = pd.read_csv(f, header=None)
-
-            error.append(abs(test - predict))
-
-        all_error = pd.concat(error)
-        mse = ((all_error ** 2).sum() / len(all_error)).values[0]
-        rmse = np.sqrt(mse)  # RMSE for full dataset
-
-        # TODO: also compute for each term individually
 
 
 class SVD(RunLibFM):
