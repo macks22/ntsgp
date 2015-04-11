@@ -576,11 +576,11 @@ class UsesLibFM(luigi.Task):
 
     @property
     def run_libfm(self):
-        def run_libfm(train_fname, test_fname, outfile=''):
+        def run_libfm(train_fname, test_fname, outfile='', dim=self.dim_start):
             return test_params.run_libfm(
                 train_fname, test_fname,
                 iter=self.iterations, std=self.init_stdev,
-                dim=self.dim_start, bias=self.use_bias, outfile=outfile)
+                dim=dim, bias=self.use_bias, outfile=outfile)
         return run_libfm
 
     @property

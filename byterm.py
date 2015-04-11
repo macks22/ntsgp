@@ -1,9 +1,11 @@
 import os
+import logging
 from collections import OrderedDict
 
 import luigi
 import pandas as pd
 import numpy as np
+import scipy.stats
 
 from recpipe import UserCourseGradeLibFM, UsesLibFM, UsesTrainTestSplit
 
@@ -102,6 +104,18 @@ class UCGLibFMByTerm(UserCourseGradeLibFM):
 
 class RunLibFMByTerm(UsesLibFM, UsesTrainTestSplit):
     """Run libFM on prediction task, evaluating term by term."""
+    # Redefine dim params to give more reasonable defaults. This task will sweep
+    # over multiple terms, running libFM once for each dimension in the range,
+    # then run it a final time for the best dimension.
+    optimize_dim = luigi.IntParameter(
+        default=1,
+        description='number of terms to use for tuning the dim param to libFM')
+    dim_start = luigi.IntParameter(
+        default=6,
+        description='start of dimension range to produce results for')
+    dim_end = luigi.IntParameter(
+        default=8,
+        description='end of dimension range to produce results for, inclusive')
 
     # note that only dim_start is used; fixed dimension
 
@@ -138,15 +152,48 @@ class RunLibFMByTerm(UsesLibFM, UsesTrainTestSplit):
             }
         return outputs
 
+    def choose_best_dim(self):
+        logging.info('optimizing dimension using %d terms' % self.optimize_dim)
+        inputs = self.input()
+        best_dims = []
+        for termnum in inputs.keys()[:self.optimize_dim + 1]:
+            logging.info('tuning dimension on termnum: %d' % termnum)
+            train = inputs[termnum]['train'].path
+            test = inputs[termnum]['test'].path
+            results = []
+            for dim in range(self.dim_start, self.dim_end + 1):
+                result = self.run_libfm(train, test, dim=dim)[1]
+                results.append([result, dim])
+
+            # Get best dimension for this term
+            results.sort()  # lowest error is first
+            best_dims.append(results[0][1])
+
+        # Choose dimension that was best most often and rerun with that
+        best_dim = scipy.stats.mode(np.array(best_dims))[0][0]
+        logging.info('best dimension found: %d' % best_dim)
+        return best_dim
+
     def run(self):
         """No need to write anything; simply pass output filenames to libFM."""
+        if self.optimize_dim:
+            dim = self.choose_best_dim()
+        else:
+            dim = self.dim_start
+
         inputs = self.input()
         outputs = self.output()
+        results = []
+        logging.info('running %s' % self.__class__.__name__ + \
+                     ' for %d terms' % len(inputs))
+
         for termnum in inputs:
             train = inputs[termnum]['train'].path
             test = inputs[termnum]['test'].path
             outfile = outputs[termnum]['predict'].path
-            self.run_libfm(train, test, outfile)
+            results.append(self.run_libfm(train, test, outfile, dim=dim))
+
+        return results
 
 
 # For some reason, setting these attributes as plain old class level variables
