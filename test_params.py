@@ -3,8 +3,15 @@ import subprocess as sub
 import argparse
 import logging
 
+import numpy as np
+
 
 LIBFM = 'libfm-1.42.src/bin/libFM'
+
+
+class LibFMFailed(Exception):
+    """LibFM returned a non-zero exit code."""
+    pass
 
 
 def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
@@ -48,12 +55,40 @@ def run_libfm(train, test, iter=20, std=0.2, dim=8, bias=False,
     logging.debug(cmd)
 
     proc = sub.Popen(cmd, shell=True, stdout=sub.PIPE)
+    retcode = proc.wait()
+    if retcode:
+        raise LibFMFailed("libFM failed to execute.\n%s" % cmd)
+
     output = proc.communicate()[0]
     lines = output.split('\n')
     rows = [row.split('\t')[1:] for row in lines[-iter:] if row]
     train_err = '%.6f' % float(rows[-1][0].split('=')[1])
     test_err = '%.6f' % float(rows[-1][1].split('=')[1])
     return [train_err, test_err]
+
+
+def libfm_predict(train, test, outfile, iter=20, std=0.2, dim=8, bias=False):
+    """Run libFM, output predictions to file, read file and return predictions
+    as an array of floats.
+
+    :rtype: numpy.ndarray of floats.
+    :return: The predictions for the test examples.
+    """
+    kwargs = {k: v for k, v in locals().items()
+              if not k in ['train', 'test']}
+    kwargs['outfile'] = outfile
+    args = compose_libfm_args(train, test, **kwargs)
+    cmd = ' '.join(args)
+    logging.debug(cmd)
+
+    proc = sub.Popen(cmd, shell=True, stdout=sub.PIPE)
+    retcode = proc.wait()
+    if retcode:
+        raise LibFMFailed("libFM failed to execute.\n%s" % cmd)
+
+    # read output and return predictions
+    with open(outfile) as f:
+        return np.array([float(num) for num in f if num])
 
 
 def test_dim(start, end, *args, **kwargs):

@@ -167,20 +167,25 @@ class PreprocessedCourseData(BasicLuigiTask):
                 'InstructorIdMap': InstructorIdMap(),
                 'OrdinalTermMap': OrdinalTermMap()}
 
+    @property
+    def grade2pts(self):
+        return grade2pts
+
+    def fill_grdpts(self, series):
+        """Fill in missing values for grade quality points."""
+        # TODO: we can fill in missing lab grades with lecture grades if we can
+        # match them up.
+        if series['GRADE'] != np.nan:
+            return self.grade2pts[series['GRADE']]
+        else:
+            return series['grdpts']
+
     def run(self):
         with self.input()['courses'].open() as f:
             courses = pd.read_csv(f)
 
         # fill in missing values for quality points
-        # TODO: we can fill in missing lab grades with lecture grades if we can
-        # match them up.
-        def fill_grdpts(series):
-            if series['GRADE'] != np.nan:
-                return grade2pts[series['GRADE']]
-            else:
-                return series['grdpts']
-
-        courses.grdpts = courses.apply(fill_grdpts, axis=1)
+        courses.grdpts = courses.apply(self.fill_grdpts, axis=1)
 
         def map_ids(input_name, idname):
             klass = globals()[input_name]
@@ -322,15 +327,6 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
     def requires(self):
         return PreprocessedCourseData()
 
-    def output(self):
-        fname = self.output_base_fname()
-        train = fname % 'train'
-        test =  fname % 'test'
-        return {
-            'train': luigi.LocalTarget(train),
-            'test': luigi.LocalTarget(test)
-        }
-
     def read_data(self):
         with self.input().open() as f:
             data = pd.read_csv(f)
@@ -466,36 +462,70 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         description='if empty; no time attributes, ' +
                     'cat = categorical encoding (TimeSVD), ' +
                     'bin = binary, one-hot encoding (BPTF)')
+    task = luigi.Parameter(
+        default='next',
+        description='prediction task; next = next-term, all = all-terms')
     ext = 'libfm'
 
-    def __init__(self, *args, **kwargs):
-        super(UserCourseGradeLibFM, self).__init__(*args, **kwargs)
-        if self.time:
-            self.suffix = 'T%s' % self.time
+    def all_term_output(self):
+        fname = self.output_base_fname()
+        guide = os.path.splitext(fname % 'guide')[0] + '.csv'
+        return {
+            'train': luigi.LocalTarget(fname % 'train'),
+            'test': luigi.LocalTarget(fname % 'test'),
+            'guide': luigi.LocalTarget(guide)
+        }
 
-    def multiplex_time(self, train, test):
-        """If time is included, as a feature, we need to specify how it will be
-        written in the libFM format. The method being emulated changes based on
-        how we choose to encode it. We multiplex based on time in the sense that
-        we define a data writing function that writes the time data differently
-        depending on what the user has specified. This function is returned.
-        """
-        if self.time == 'bin':  # one-hot encoding; BPTF
-            max_col_idx = max(
-                np.concatenate((test.cid.values, train.cid.values)))
-            def write_libfm_data(f, data):
-                data.termnum += max_col_idx
-                write_libfm(f, data, timecol='termnum')
-        elif self.time == 'cat':  # categorical; TimeSVD
-            max_col_idx = max(
-                np.concatenate((test.cid.values, train.cid.values)))
-            def write_libfm_data(f, data):
-                write_libfm(f, data, timecol='termnum',
-                            time_feat_num=max_col_idx + 1)
+    def next_term_output(self):
+        fname = self.output_base_fname()
+        outputs = {}
+        for termnum in self.term_range:  # don't write files for last num
+            train = '%s%d' % ('train', termnum)
+            test = '%s%d' % ('test', termnum)
+            outputs[termnum] = {
+                'train': luigi.LocalTarget(fname % train),
+                'test': luigi.LocalTarget(fname % test)
+            }
+        return outputs
+
+    def output(self):
+        if self.task == 'all':
+            return self.all_term_output()
         else:
-            write_libfm_data = write_libfm
+            return self.next_term_output()
 
-        return write_libfm_data
+    @property
+    def train(self):
+        try: return self._train
+        except: self._train, self._test = self.prep_data()
+        return self._train
+
+    @train.setter
+    def train(self, train):
+        self._train = train
+
+    @property
+    def test(self):
+        try: return self._test
+        except: self._train, self._test = self.prep_data()
+        return self._test
+
+    @test.setter
+    def test(self, test):
+        self._test = test
+
+    @property
+    def term_range(self):
+        """All terms for which prediction should be performed."""
+        # Due to the backfilling, we must rely on the train filters to get the
+        # last term in the training data.
+        start = max([f.cohort_end for f in self.filters])
+        end = int(self.test[~self.test.cohort.isnull()].cohort.max())
+        return range(start + 1, end + 1)
+
+    @property
+    def suffix(self):
+        return 'T%s' % self.time if self.time else ''
 
     def prep_data(self):
         """libFM has no notion of columns. It simply takes feature vectors with
@@ -507,326 +537,78 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         test.cid += max_row_idx
         return (train, test)
 
-    def run(self):
-        train, test = self.prep_data()
+    @property
+    def write_libfm_data(self):
+        """If time is included, as a feature, we need to specify how it will be
+        written in the libFM format. The method being emulated changes based on
+        how we choose to encode it. We multiplex based on time in the sense that
+        we define a data writing function that writes the time data differently
+        depending on what the user has specified. This function is returned.
+        """
+        # one-hot encoding; BTPF
+        if self.time == 'bin':
+            max_col_idx = max(
+                np.concatenate((self.test.cid.values, self.train.cid.values)))
 
-        # Determine what to do with time
-        write_libfm_data = self.multiplex_time(train, test)
+            def write_libfm_data(f, data):
+                data.termnum += max_col_idx
+                write_libfm(f, data, timecol='termnum')
 
-        # write the train/test data
-        for name, dataset in zip(['train', 'test'], [train, test]):
+        # categorical encoding; TimeSVD
+        elif self.time == 'cat':
+            max_col_idx = max(
+                np.concatenate((self.test.cid.values, self.train.cid.values)))
+
+            def write_libfm_data(f, data):
+                write_libfm(f, data, timecol='termnum',
+                            time_feat_num=max_col_idx + 1)
+
+        # do not include time variables in output
+        else:
+            write_libfm_data = write_libfm
+
+        return write_libfm_data
+
+    def transfer_term(self, termnum):
+        """Move data for the given term from the test set to the train set."""
+        tomove_mask = self.test.termnum == termnum
+        self.train = pd.concat((self.train, self.test[tomove_mask]))
+        self.test = self.test[~tomove_mask]
+
+    def produce_all_term_data(self):
+        """Produce train/test data for all-term prediction task."""
+        for name, dataset in zip(['train', 'test'], [self.train, self.test]):
             with self.output()[name].open('w') as f:
-                write_libfm_data(f, dataset)
+                self.write_libfm_data(f, dataset)
 
+        # Write the term-to-id guide
+        task.test['rownum'] = np.arange(len(task.test))
+        guide = task.test.groupby('termnum').max()['rownum']
+        with self.output()['guide'].open('w') as f:
+            guide.to_csv(f, index_label='termnum', header=True)
 
-class UsesLibFM(luigi.Task):
-    """Base class for any class that uses libFM to produce results."""
-    time = luigi.Parameter(
-        default='',
-        description='if empty; no time attributes, ' +
-                    'cat = categorical encoding (TimeSVD), ' +
-                    'bin = binary, one-hot encoding (BPTF)')
-    iterations = luigi.IntParameter(
-        default=100,
-        description='number of iterations to use for learning')
-    init_stdev = luigi.FloatParameter(
-        default=0.5,
-        description='initial std of Gaussian spread; higher can be faster')
-    use_bias = luigi.BoolParameter(
-        default=False,
-        description='use global and per-feature bias terms if True')
-    dim_start = luigi.IntParameter(
-        default=5,
-        description='start of dimension range to produce results for')
-    dim_end = luigi.IntParameter(
-        default=10,
-        description='end of dimension range to produce results for, inclusive')
+    def produce_next_term_data(self):
+        """Produce multiple train/test splits; one for each term to predict."""
+        outputs = self.output()
+        for termnum in self.term_range:  # includes (end term + 1)
+            test = self.test[self.test.termnum == termnum]
+            for name, dataset in zip(['train', 'test'], [self.train, test]):
+                with outputs[termnum][name].open('w') as f:
+                    self.write_libfm_data(f, dataset)
+            self.transfer_term(termnum)  # modify train/test sets in place
+            # intentionally skip writing the last time this is run
 
-    prefix = ''
-
-    @property
-    def libfm_arg_indicators(self):
-        parts = []
-
-        # time information part
-        if self.time:
-            parts.append('T%s' % self.time)
-
-        # number of iterations part
-        parts.append('i%d' % self.iterations)
-
-        # initial standard deviation part (init_stdev)
-        std = 's%s' % ''.join(str(self.init_stdev).split('.'))
-        parts.append(std)
-
-        # bias terms part
-        if self.use_bias:
-            parts.append('b')
-
-        return parts
-
-    @property
-    def libfm_command(self):
-        def show_libfm_command(train_fname, test_fname, outfile=''):
-            return ' '.join(test_params.compose_libfm_args(
-                train_fname, test_fname, self.iterations,
-                dim=self.dim_start, std=self.init_stdev,
-                bias=self.use_bias, outfile=outfile))
-        return show_libfm_command
-
-    @property
-    def run_libfm(self):
-        def run_libfm(train_fname, test_fname, outfile='', dim=self.dim_start):
-            return test_params.run_libfm(
-                train_fname, test_fname,
-                iter=self.iterations, std=self.init_stdev,
-                dim=dim, bias=self.use_bias, outfile=outfile)
-        return run_libfm
-
-    @property
-    def run_libfm_ndim(self):
-        def run_libfm(train_fname, test_fname, outfile=''):
-            return test_params.test_dim(
-                self.dim_start, self.dim_end,
-                train_fname, test_fname, self.iterations,
-                std=self.init_stdev, bias=self.use_bias, outfile=outfile)
-        return run_libfm
-
-
-class RunLibFM(UsesLibFM, UserCourseGradeLibFM):
-    """General-purpose wrapper that spawns a subprocess to run libFM."""
-
-    base = 'outcomes'
-    ext = 'tsv'
-
-    def requires(self):
-        task_params = [tup[0] for tup in UserCourseGradeLibFM.get_params()]
-        params = {k:v for k, v in self.param_kwargs.items() if k in task_params}
-        return UserCourseGradeLibFM(**params)
-
-    def output(self):
-        parts = self.libfm_arg_indicators
-        self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
-        fname = base_fname % self.__class__.__name__
-        return luigi.LocalTarget(fname)
+        # TODO: this code converts the same records to libFM format multiple
+        # times. Each subsequent train set contains records in the last train
+        # set. These could be cached to avoid all of the string format
+        # conversion overhead.
 
     def run(self):
-        inputs = self.input()
-        results = self.run_libfm_ndim(
-            inputs['train'].path,
-            inputs['test'].path
-        )
-
-        with self.output().open('w') as f:
-            output = '\n'.join(['\t'.join(result) for result in results])
-            f.write(output)
-
-
-class SVD(RunLibFM):
-    """Run libFM to emulate SVD."""
-    use_bias = False
-    time = ''
-
-class BiasedSVD(SVD):
-    """Run libFM to emulate biased SVD."""
-    use_bias = True
-
-class TimeSVD(SVD):
-    """Run libFM to emulate TimeSVD."""
-    time = 'cat'
-
-class BiasedTimeSVD(TimeSVD):
-    """Run libFM to emulate biased TimeSVD."""
-    use_bias = True
-
-class BPTF(RunLibFM):
-    """Run libFM to emulate Bayesian Probabilistic Tensor Factorization."""
-    use_bias = False
-    time = 'bin'
-
-class BiasedBPTF(BPTF):
-    """Run libFM to emulate biased BPTF."""
-    use_bias = True
-
-
-class RunAllOnSplit(RunLibFM):
-    """Run all available methods via libFM for a particular train/test split."""
-    train_filters = luigi.Parameter(  # restate to make non-optional
-        description='Specify how to split the train set from the test set.')
-    time = ''     # disable parameter
-    use_bias = '' # disable parameter
-
-    def requires(self):
-        return [
-            SVD(**self.param_kwargs),
-            BiasedSVD(**self.param_kwargs),
-            TimeSVD(**self.param_kwargs),
-            BiasedTimeSVD(**self.param_kwargs),
-            BPTF(**self.param_kwargs),
-            BiasedBPTF(**self.param_kwargs)
-        ]
-
-    def output(self):
-        return [luigi.LocalTarget(f.path) for f in self.input()]
-
-    def extract_method_name(self, outfile):
-        base = os.path.splitext(outfile)[0]
-        method = os.path.splitext(base)[1].strip('.')
-        return method
-
-    @property
-    def method_names(self):
-        return [self.extract_method_name(f.path) for f in self.input()]
-
-    run = luigi.Task.run  # reset to default
-
-
-class CompareMethods(RunAllOnSplit):
-    """Aggregate results from all available methods on a particular split."""
-    topn = luigi.IntParameter(
-        default=3,
-        description="top n results to keep for each method")
-
-    base = 'outcomes'
-    ext = 'tsv'
-    suffix = ''
-
-    def output(self):
-        # include indicators for arguments that are the same across all methods
-        # number of iterations part
-        parts = ['i%d' % self.iterations]
-
-        # initial standard deviation part (init_stdev)
-        std = 's%s' % ''.join(str(self.init_stdev).split('.'))
-        parts.append(std)
-
-        # combine with current suffix
-        parts.append('compare')
-        self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
-
-        fname = base_fname % 'top%d' % self.topn
-        return luigi.LocalTarget(fname)
-
-    def requires(self):
-        return RunAllOnSplit(train_filters=self.train_filters)
-
-    def read_results(self, f):
-        content = f.read()
-        rows = [l.split('\t') for l in content.split('\n')]
-        rows = [[int(r[0]),float(r[1]),float(r[2])] for r in rows]
-        return rows
-
-    def run(self):
-        results = []  # store results for all methods
-        for input in self.input():
-            with input.open() as f:
-                rows = self.read_results(f)
-
-            # add method name to each result for this method
-            method_name = self.extract_method_name(input.path)
-            for row in rows:
-                row.insert(0, method_name)
-
-            # keep the top 3 results for each method
-            top = list(sorted(rows, key=lambda tup: tup[-1]))
-            results += top[:self.topn]
-
-        # now we have results from all methods, sort them
-        top = list(sorted(results, key=lambda tup: tup[-1]))
-        with self.output().open('w') as f:
-            f.write('\t'.join(('method', 'dim', 'train', 'test')) + '\n')
-            f.write('\n'.join(['\t'.join(map(str, row)) for row in top]))
-
-
-class ResultsMarkdownTable(CompareMethods):
-    """Produce markdown table of results comparison for a data split."""
-    precision = luigi.IntParameter(
-        default=5,
-        description='number of decimal places to keep for error measurements')
-
-    def requires(self):
-        kwargs = self.param_kwargs.copy()
-        del kwargs['precision']
-        return CompareMethods(**kwargs)
-
-    def output(self):
-        outname = self.input().path
-        base = os.path.splitext(outname)[0]
-        return luigi.LocalTarget('%s.md' % base)
-
-    def read_results(self, f):
-        header = f.readline().strip().split('\t')
-        content = f.read()
-        rows = [l.split('\t') for l in content.split('\n')]
-        fmt = '%.{}f'.format(self.precision)
-        for row in rows:
-            row[2] = fmt % float(row[2])
-            row[3] = fmt % float(row[3])
-        return header, rows
-
-    def run(self):
-        with self.input().open() as f:
-            header, rows = self.read_results(f)
-
-        # results are already sorted; we simply need to format them as a
-        # markdown table; first find the column widths, leaving a bit of margin
-        # space for readability
-        widths = np.array([[len(item) for item in row]
-                           for row in rows]).max(axis=0)
-        margin = 4
-        colwidths = widths + margin
-        underlines = ['-' * width for width in widths]
-
-        # next, justify the columns appropriately
-        def format_row(row):
-            return [row[0].ljust(colwidths[0])] + \
-                   [row[i].rjust(colwidths[i]) for i in range(1, 4)]
-
-        output = [format_row(header), format_row(underlines)]
-        output += [format_row(row) for row in rows]
-
-        # finally, write the table
-        with self.output().open('w') as f:
-            f.write('\n'.join([''.join(row) for row in output]))
-
-
-class RunAll(luigi.Task):
-    """Run all available methods on 0-4 and 0-7 train/test splits."""
-
-    # The splits divide the data into these proportions (train | test)
-    # ----------------------------------------------------------------
-    # 0-1  (2009-2009): .282 | .718
-    # 0-4  (2009-2010): .542 | .458
-    # 0-7  (2009-2011): .758 | .242
-    # 0-10 (2009-2012): .910 | .240
-
-    splits = ["0-1", "0-4", "0-7", "0-10"]  # 4 splits
-    backfills = [0, 1, 2, 3, 4, 5]  # 6 backfill settings
-
-    @property
-    def num_method_runs(self):
-        """How many times libFM is run."""
-        task = RunAllOnSplit(train_filters=self.splits[0])
-        num_methods = len(task.deps())
-        return num_methods * len(self.splits) * len(self.backfills)
-
-    @property
-    def num_iterations(self):
-        """The total number of iterations libFM is run over all methods."""
-        task = RunAllOnSplit(train_filters=self.splits[0])
-        dim_range = task.dim_end - task.dim_start
-        return task.iterations * dim_range * self.complexity
-
-    # TODO: extend this to actually perform comparison between results
-    def requires(self):
-        for split in self.splits:
-            for backfill in self.backfills:
-                yield ResultsMarkdownTable(
-                    train_filters=split,
-                    backfill_cold_students=backfill,
-                    backfill_cold_courses=backfill)
+        """Write the train/test data in libFM format."""
+        if self.task == 'all':
+            self.produce_all_term_data()
+        else:
+            self.produce_next_term_data()
 
 
 if __name__ == "__main__":
