@@ -22,6 +22,9 @@ class UsesLibFM(UsesTrainTestSplit):
         description='if empty; no time attributes, ' +
                     'cat = categorical encoding (TimeSVD), ' +
                     'bin = binary, one-hot encoding (BPTF)')
+    task = luigi.Parameter(
+        default='next',
+        description='prediction task; next = next-term, all = all-terms')
     iterations = luigi.IntParameter(
         default=150,
         description='number of iterations to use for learning')
@@ -119,9 +122,9 @@ class UsesLibFM(UsesTrainTestSplit):
 
 class RunLibFM(UsesLibFM):
     """General-purpose wrapper that spawns a subprocess to run libFM."""
-    task = luigi.Parameter(
-        default='next',
-        description='prediction task; next = next-term, all = all-terms')
+    remove_cold_start = luigi.BoolParameter(
+        default=True,
+        description="remove all cold-start records from test set")
     base = 'predict'
     ext = 'tsv'
 
@@ -263,6 +266,7 @@ class RunLibFM(UsesLibFM):
         header = ['term%d' % tnum for tnum in sqerror]
         with self.output()['error'].open('w') as f:
             f.write('\t'.join(header) + '\n')
+            f.write('\t'.join(map(str, counts)) + '\n')
             f.write('\t'.join(rmse_vals) + '\n')
             f.write('\t'.join(running_vals))
 
@@ -367,7 +371,7 @@ class CompareMethods(RunAllOnSplit):
         for f in self.input():
             name = self.extract_method_name(f.path)
             with f.open() as f:
-                header, perterm, running = self.read_results(f)
+                header, counts, perterm, running = self.read_results(f)
                 results[name] = [perterm, running]
 
         # now we have results from all methods, sort them by total rmse
@@ -377,6 +381,7 @@ class CompareMethods(RunAllOnSplit):
         head = '\t'.join(['method', 'rmse'] + header)
         with self.output().open('w') as f:
             f.write('%s\n' % head)
+            f.write('%s\n' % '\t'.join(['', ''] + counts))
             for name, (perterm, _) in records:
                 f.write('%s\n' % '\t'.join([name, 'per-term'] + perterm))
 
@@ -397,13 +402,14 @@ class ResultsMarkdownTable(CompareMethods):
 
     def read_results(self, f):
         header = f.readline().strip().split('\t')
+        counts = ['# test records', ''] + f.readline().strip().split('\t')
         content = f.read()
         rows = [l.split('\t') for l in content.split('\n')]
-        return header, rows
+        return header, counts, rows
 
     def run(self):
         with self.input().open() as f:
-            header, rows = self.read_results(f)
+            header, counts, rows = self.read_results(f)
 
         # results are already sorted; we simply need to format them as a
         # markdown table; first find the column widths, leaving a bit of margin
@@ -419,10 +425,10 @@ class ResultsMarkdownTable(CompareMethods):
             return [row[i].ljust(colwidths[i]) for i in range(0, 2)] + \
                    [row[i].rjust(colwidths[i]) for i in range(2, len(row))]
 
-        table1 = [format_row(header), format_row(underlines)]
+        table1 = [format_row(header), format_row(underlines), format_row(counts)]
         table2 = table1[:]
         for row in rows:
-            if row and row[0]:
+            if row and row[-1]:
                 if row[1] == 'per-term':
                     table1.append(format_row(row))
                 else:
@@ -445,14 +451,18 @@ class RunAll(luigi.Task):
     # 0-10 (2009-2012): .910 | .240
 
     splits = ["0-1", "0-4", "0-7", "0-10"]  # 4 splits
-    backfills = [0, 1, 2, 3, 4, 5]  # 6 backfill settings
+    tasks = ["all", "next"]  # 2 prediction tasks
+
+    # Backfilling may be an unfair way to mix the data -- definitely for
+    # courses, and likely for students as well.
+    # backfills = [0, 1, 2, 3, 4, 5]  # 6 backfill settings
 
     @property
     def num_method_runs(self):
         """How many times libFM is run."""
         task = RunAllOnSplit(train_filters=self.splits[0])
         num_methods = len(task.deps())
-        return num_methods * len(self.splits) * len(self.backfills)
+        return num_methods * len(self.splits) * len(self.tasks)
 
     @property
     def num_iterations(self):
@@ -463,11 +473,8 @@ class RunAll(luigi.Task):
     # TODO: extend this to actually perform comparison between results
     def requires(self):
         for split in self.splits:
-            for backfill in self.backfills:
-                yield ResultsMarkdownTable(
-                    train_filters=split,
-                    backfill_cold_students=backfill,
-                    backfill_cold_courses=backfill)
+            for task in self.tasks:
+                yield ResultsMarkdownTable(train_filters=split, task=task)
 
 
 if __name__ == "__main__":

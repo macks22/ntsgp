@@ -282,11 +282,14 @@ class UsesTrainTestSplit(luigi.Task):
         default=True,
         description='drop W/S/NC grades from training data if True')
     backfill_cold_students = luigi.IntParameter(
-        default=3,
+        default=0,
         description="number of courses to backfill for cold-start students")
     backfill_cold_courses = luigi.IntParameter(
-        default=3,
+        default=0,
         description="number of courses to backfill for cold-start courses")
+    remove_cold_start = luigi.BoolParameter(
+        default=True,
+        description="remove all cold-start records from test set")
 
     base = 'data'  # directory to write files to
     ext = 'tsv'    # final file extension for output files
@@ -310,8 +313,11 @@ class UsesTrainTestSplit(luigi.Task):
             parts.append('ng')
 
         # indicate whether cold-start backfilling was done for students/courses
-        parts.append('scs%d' % self.backfill_cold_students)
-        parts.append('ccs%d' % self.backfill_cold_courses)
+        if self.remove_cold_start:
+            parts.append('nocs')
+        else:
+            parts.append('scs%d' % self.backfill_cold_students)
+            parts.append('ccs%d' % self.backfill_cold_courses)
 
         # include optional class-specific suffix
         if self.suffix:
@@ -395,10 +401,12 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
 
         # if instructed to avoid student/course cold-start,
         # ensure all students/courses in the test set are also in the train set
-        train, test = self.backfill(
-            train, test, 'sid', self.backfill_cold_students)
-        train, test = self.backfill(
-            train, test, 'cid', self.backfill_cold_courses)
+        if not self.remove_cold_start:
+            train, test = self.backfill(
+                train, test, 'sid', self.backfill_cold_students)
+            train, test = self.backfill(
+                train, test, 'cid', self.backfill_cold_courses)
+
         return (train, test)
 
 
@@ -575,16 +583,28 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         self.train = pd.concat((self.train, self.test[tomove_mask]))
         self.test = self.test[~tomove_mask]
 
+    def handle_cold_start(self, test):
+        """If requested, remove cold start, else do nothing."""
+        if self.remove_cold_start:
+            for key in ['sid', 'cid']:
+                diff = np.setdiff1d(test[key].values, self.train[key].values)
+                diff_mask = test[key].isin(diff)
+                return test[~diff_mask]
+
     def produce_all_term_data(self):
         """Produce train/test data for all-term prediction task."""
-        for name, dataset in zip(['train', 'test'], [self.train, self.test]):
+        # remove cold start records if requested
+        test = self.test.copy()
+        test = self.handle_cold_start(test)
+
+        for name, dataset in zip(['train', 'test'], [self.train, test]):
             with self.output()[name].open('w') as f:
                 self.write_libfm_data(f, dataset)
 
         # Write the term-to-id guide
-        self.test = self.test.sort(('termnum'))
-        self.test['rownum'] = np.arange(len(self.test))
-        guide = self.test.groupby('termnum').max()['rownum']
+        test = test.sort(('termnum'))
+        test['rownum'] = np.arange(len(test))
+        guide = test.groupby('termnum').max()['rownum']
         with self.output()['guide'].open('w') as f:
             guide.to_csv(f, index_label='termnum', header=True)
 
@@ -593,6 +613,10 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         outputs = self.output()
         for termnum in self.term_range:  # includes (end term + 1)
             test = self.test[self.test.termnum == termnum]
+
+            # remove cold start recordsif requested
+            test = self.handle_cold_start(test)
+
             for name, dataset in zip(['train', 'test'], [self.train, test]):
                 with outputs[termnum][name].open('w') as f:
                     self.write_libfm_data(f, dataset)
