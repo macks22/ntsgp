@@ -10,6 +10,11 @@ import test_params
 from recpipe import UserCourseGradeLibFM, UsesTrainTestSplit
 
 
+class UnexpectedNaN(Exception):
+    """Raise when np.nan values are found unexpectedly."""
+    pass
+
+
 class UsesLibFM(UsesTrainTestSplit):
     """Base class for any class that uses libFM to produce results."""
     time = luigi.Parameter(
@@ -49,7 +54,7 @@ class UsesLibFM(UsesTrainTestSplit):
         parts.append(std)
 
         # include dimensionality
-        parts.append('dim%d' % self.dim)
+        parts.append('d%d' % self.dim)
 
         # bias terms part
         if self.use_bias:
@@ -117,10 +122,8 @@ class RunLibFM(UsesLibFM):
     task = luigi.Parameter(
         default='next',
         description='prediction task; next = next-term, all = all-terms')
-    base = 'outcomes'
-    ext = 'tsv'
-
     base = 'predict'
+    ext = 'tsv'
 
     @property
     def guide(self):
@@ -137,17 +140,28 @@ class RunLibFM(UsesLibFM):
         else:
             return self.subtask.term_range
 
-    def output(self):
+    @property
+    def base_outfile_name(self):
         parts = self.libfm_arg_indicators
+        parts.append('aterm' if self.task == 'all' else 'nterm')
         self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
+        return self.output_base_fname()
+
+    def output(self):
+        base_fname = self.base_outfile_name
         subext = '{}.t%d'.format(self.__class__.__name__)
         error_ext = '{}.rmse'.format(self.__class__.__name__)
+        error_fname = base_fname % error_ext
 
-        outputs = {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
-                   for termnum in self.term_range}
+        if self.task == 'next':
+            outputs = \
+                {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
+                 for termnum in self.term_range}
+        else:
+            outputs = luigi.LocalTarget(base_fname % self.__class__.__name__)
+
         return {
-            'error': luigi.LocalTarget(base_fname % error_ext),
+            'error': luigi.LocalTarget(error_fname),
             'predict': outputs
         }
 
@@ -183,17 +197,26 @@ class RunLibFM(UsesLibFM):
         train = inputs['train'].path
         test_file = inputs['test']
         test = test_file.path
-        outfile = self.outputs()['predict'].path
+        outfile = self.output()['predict'].path
         guide_file = inputs['guide']
 
         # run libFM to compute all predictions in one pass.
         results = self.libfm_predict(train, test, outfile)
+        nan_mask = np.isnan(results)
+        if nan_mask.any():
+            raise UnexpectedNaN(
+                "%d np.nan values in libFM predictions." % nan_mask.sum())
 
         # Now match up predictions with labeled test examples.
         # First read the labeled test grades.
         with test_file.open() as f:
             test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
             test = test.values[:,0]
+
+        nan_mask = np.isnan(test)
+        if nan_mask.any():
+            raise UnexpectedNaN(
+                "%d np.nan values in test values." % nan_mask.sum())
 
         # The guide tells us which examples are from which term.
         with guide_file.open() as f:
@@ -203,9 +226,10 @@ class RunLibFM(UsesLibFM):
         error = OrderedDict()
         pos = 0
         for termnum in guide.index:
-            last_rownum = guide.id[termnum] + 1
+            last_rownum = guide.rownum[termnum] + 1
             predicted = results[pos: last_rownum]
-            error[termnum] = abs(predicted - test) ** 2
+            testvals = test[pos: last_rownum]
+            error[termnum] = abs(predicted - testvals) ** 2
             pos = last_rownum
 
         return error
@@ -302,7 +326,7 @@ class RunAllOnSplit(RunLibFM):
         present before the last two extensions. For example: SVD.t9.pred.
         """
         subext = os.path.splitext(outfile)[0]
-        base = os.path.splitext(base)[0]
+        base = os.path.splitext(subext)[0]
         return os.path.splitext(base)[1].strip('.')
 
     @property
@@ -321,56 +345,50 @@ class CompareMethods(RunAllOnSplit):
     subtask_class = RunAllOnSplit
 
     def output(self):
-        parts = self.libfm_arg_indicators
-        self.suffix = '-'.join(parts)
-        base_fname = self.output_base_fname()
+        base_fname = self.base_outfile_name
         fname = base_fname % 'compare'
         return luigi.LocalTarget(fname)
 
     def requires(self):
         return self.subtask
 
-    # TODO: LEFT OF HERE; FINISH UP WITH CLASS DEFINITION TO COMPARE RESULTS
-    # ACROSS METHODS
+    @property
+    def method_names(self):
+        return [self.extract_method_name(f.path) for f in self.input()]
 
     def read_results(self, f):
-        content = f.read()
-        rows = [l.split('\t') for l in content.split('\n')]
-        rows = [[int(r[0]),float(r[1]),float(r[2])] for r in rows]
-        return rows
+        """Each file has a header, with the term numbers, a row of RMSE scores
+        per term, and then a final row of running average RMSE.
+        """
+        return [l.split('\t') for l in f.read().split('\n')]
 
     def run(self):
-        results = []  # store results for all methods
-        for input in self.input():
-            with input.open() as f:
-                rows = self.read_results(f)
+        results = {}
+        for f in self.input():
+            name = self.extract_method_name(f.path)
+            with f.open() as f:
+                header, perterm, running = self.read_results(f)
+                results[name] = [perterm, running]
 
-            # add method name to each result for this method
-            method_name = self.extract_method_name(input.path)
-            for row in rows:
-                row.insert(0, method_name)
-
-            # keep the top 3 results for each method
-            top = list(sorted(rows, key=lambda tup: tup[-1]))
-            results += top[:self.topn]
-
-        # now we have results from all methods, sort them
-        top = list(sorted(results, key=lambda tup: tup[-1]))
+        # now we have results from all methods, sort them by total rmse
+        records = results.items()
+        total_rmse = lambda pair: pair[1][1][-1]
+        records.sort(key=total_rmse)
+        head = '\t'.join(['method', 'rmse'] + header)
         with self.output().open('w') as f:
-            f.write('\t'.join(('method', 'dim', 'train', 'test')) + '\n')
-            f.write('\n'.join(['\t'.join(map(str, row)) for row in top]))
+            f.write('%s\n' % head)
+            for name, (perterm, _) in records:
+                f.write('%s\n' % '\t'.join([name, 'per-term'] + perterm))
+
+            f.write('\n')
+            for name, (_, running) in records:
+                f.write('%s\n' % '\t'.join([name, 'running'] + running))
 
 
 class ResultsMarkdownTable(CompareMethods):
     """Produce markdown table of results comparison for a data split."""
-    precision = luigi.IntParameter(
-        default=5,
-        description='number of decimal places to keep for error measurements')
 
-    def requires(self):
-        kwargs = self.param_kwargs.copy()
-        del kwargs['precision']
-        return CompareMethods(**kwargs)
+    subtask_class = CompareMethods
 
     def output(self):
         outname = self.input().path
@@ -381,10 +399,6 @@ class ResultsMarkdownTable(CompareMethods):
         header = f.readline().strip().split('\t')
         content = f.read()
         rows = [l.split('\t') for l in content.split('\n')]
-        fmt = '%.{}f'.format(self.precision)
-        for row in rows:
-            row[2] = fmt % float(row[2])
-            row[3] = fmt % float(row[3])
         return header, rows
 
     def run(self):
@@ -397,20 +411,27 @@ class ResultsMarkdownTable(CompareMethods):
         widths = np.array([[len(item) for item in row]
                            for row in rows]).max(axis=0)
         margin = 4
-        colwidths = widths + margin
+        colwidths = np.array(widths) + margin
         underlines = ['-' * width for width in widths]
 
         # next, justify the columns appropriately
         def format_row(row):
-            return [row[0].ljust(colwidths[0])] + \
-                   [row[i].rjust(colwidths[i]) for i in range(1, 4)]
+            return [row[i].ljust(colwidths[i]) for i in range(0, 2)] + \
+                   [row[i].rjust(colwidths[i]) for i in range(2, len(row))]
 
-        output = [format_row(header), format_row(underlines)]
-        output += [format_row(row) for row in rows]
+        table1 = [format_row(header), format_row(underlines)]
+        table2 = table1[:]
+        for row in rows:
+            if row and row[0]:
+                if row[1] == 'per-term':
+                    table1.append(format_row(row))
+                else:
+                    table2.append(format_row(row))
 
-        # finally, write the table
+        # finally, write the tables
         with self.output().open('w') as f:
-            f.write('\n'.join([''.join(row) for row in output]))
+            f.write('\n'.join([''.join(row) for row in table1]) + '\n\n')
+            f.write('\n'.join([''.join(row) for row in table2]))
 
 
 class RunAll(luigi.Task):
@@ -437,8 +458,7 @@ class RunAll(luigi.Task):
     def num_iterations(self):
         """The total number of iterations libFM is run over all methods."""
         task = RunAllOnSplit(train_filters=self.splits[0])
-        dim_range = task.dim_end - task.dim_start
-        return task.iterations * dim_range * self.complexity
+        return task.iterations * self.complexity
 
     # TODO: extend this to actually perform comparison between results
     def requires(self):
