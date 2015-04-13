@@ -582,8 +582,9 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
                 self.write_libfm_data(f, dataset)
 
         # Write the term-to-id guide
-        task.test['rownum'] = np.arange(len(task.test))
-        guide = task.test.groupby('termnum').max()['rownum']
+        self.test = self.test.sort(('termnum'))
+        self.test['rownum'] = np.arange(len(self.test))
+        guide = self.test.groupby('termnum').max()['rownum']
         with self.output()['guide'].open('w') as f:
             guide.to_csv(f, index_label='termnum', header=True)
 
