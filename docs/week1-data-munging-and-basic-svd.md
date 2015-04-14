@@ -1,6 +1,9 @@
-% DegreePlanner: Data Munging and Basic SVD For Grade Prediction
-% Mack Sweeney
-% March 26, 2015
+---
+title: "DegreePlanner: Data Munging and Basic SVD For Grade Prediction"
+author: Mack Sweeney
+date: March 26, 2015
+geometry: margin=1.25in
+---
 
 # Overview
 

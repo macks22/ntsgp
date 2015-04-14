@@ -1,6 +1,9 @@
-% DegreePlanner: Incorporating Temporal Information in Grade Prediction
-% Mack Sweeney
-% April 3, 2015
+---
+title: "DegreePlanner: Incorporating Temporal Information in Grade Prediction"
+author: Mack Sweeney
+date: April 3, 2015
+geometry: margin=1.25in
+---
 
 # Motivation
 
