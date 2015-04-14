@@ -287,8 +287,8 @@ class UsesTrainTestSplit(luigi.Task):
     backfill_cold_courses = luigi.IntParameter(
         default=0,
         description="number of courses to backfill for cold-start courses")
-    remove_cold_start = luigi.BoolParameter(
-        default=True,
+    remove_cold_start = luigi.IntParameter(
+        default=1,
         description="remove all cold-start records from test set")
 
     base = 'data'  # directory to write files to
@@ -590,6 +590,8 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
                 diff = np.setdiff1d(test[key].values, self.train[key].values)
                 diff_mask = test[key].isin(diff)
                 return test[~diff_mask]
+        else:
+            return test
 
     def produce_all_term_data(self):
         """Produce train/test data for all-term prediction task."""

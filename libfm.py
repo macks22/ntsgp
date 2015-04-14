@@ -122,8 +122,8 @@ class UsesLibFM(UsesTrainTestSplit):
 
 class RunLibFM(UsesLibFM):
     """General-purpose wrapper that spawns a subprocess to run libFM."""
-    remove_cold_start = luigi.BoolParameter(
-        default=True,
+    remove_cold_start = luigi.IntParameter(
+        default=1,
         description="remove all cold-start records from test set")
     base = 'predict'
     ext = 'tsv'
@@ -442,6 +442,24 @@ class ResultsMarkdownTable(CompareMethods):
 
 class RunAll(luigi.Task):
     """Run all available methods on 0-4 and 0-7 train/test splits."""
+    iterations = luigi.IntParameter(
+        default=150,
+        description='number of iterations to use for learning')
+    init_stdev = luigi.FloatParameter(
+        default=0.5,
+        description='initial std of Gaussian spread; higher can be faster')
+    discard_nongrade = luigi.Parameter(
+        default=True,
+        description='drop W/S/NC grades from training data if True')
+    backfill_cold_students = luigi.IntParameter(
+        default=0,
+        description="number of courses to backfill for cold-start students")
+    backfill_cold_courses = luigi.IntParameter(
+        default=0,
+        description="number of courses to backfill for cold-start courses")
+    remove_cold_start = luigi.IntParameter(
+        default=1,
+        description="remove all cold-start records from test set")
 
     # The splits divide the data into these proportions (train | test)
     # ----------------------------------------------------------------
@@ -460,21 +478,22 @@ class RunAll(luigi.Task):
     @property
     def num_method_runs(self):
         """How many times libFM is run."""
-        task = RunAllOnSplit(train_filters=self.splits[0])
+        task = RunAllOnSplit(train_filters=self.splits[0], **self.param_kwargs)
         num_methods = len(task.deps())
         return num_methods * len(self.splits) * len(self.tasks)
 
     @property
     def num_iterations(self):
         """The total number of iterations libFM is run over all methods."""
-        task = RunAllOnSplit(train_filters=self.splits[0])
+        task = RunAllOnSplit(train_filters=self.splits[0], **self.param_kwargs)
         return task.iterations * self.complexity
 
     # TODO: extend this to actually perform comparison between results
     def requires(self):
         for split in self.splits:
             for task in self.tasks:
-                yield ResultsMarkdownTable(train_filters=split, task=task)
+                yield ResultsMarkdownTable(
+                    train_filters=split, task=task, **self.param_kwargs)
 
 
 if __name__ == "__main__":
