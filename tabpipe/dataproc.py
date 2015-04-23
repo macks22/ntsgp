@@ -49,6 +49,7 @@ import os
 import hashlib
 
 import pandas as pd
+import numpy as np
 import luigi
 
 
@@ -95,39 +96,54 @@ class TableBase(luigi.Task, TableMixin):
     savedir = luigi.Parameter(
         default='',
         description='directory to save data files to; default is cwd')
-    colname = luigi.Parameter(
-        description='name of column to scrub')
-    # Not used for some subclasses; may reconsider having this here.
-    othercols = luigi.Parameter(
-        default=[],
-        description='other columns to use for scrubbing')
+    colnames = luigi.Parameter(
+        description='name of column to scrub is first, then any others')
     outname = luigi.Parameter(
         description='filename to output transformed table to')
 
     @property
+    def multiple_columns(self):
+        """True if `colnames` is an interable, else False."""
+        return hasattr(self.colnames, '__iter__')
+
+    @property
+    def cols(self):
+        """Colnames to use as function input; list of 1+ strings."""
+        return list(self.colnames) if self.multiple_columns else [self.colnames]
+
+    @property
     def usecols(self):
-        cols = [0, self.colname]  # include 0 for index
-        if self.othercols:
-            if hasattr(self.othercols, '__iter__'):
-                cols.extend(self.othercols)
-            else:  # string
-                cols.append(self.othercols)
-        return cols
+        """Columns to use for reading data tables. Always assume index."""
+        return [0] + self.cols
+
+    @property
+    def colname(self):
+        """Main colname to use for table output and function input."""
+        return self.colnames[0] if self.multiple_columns else self.colnames
 
     def read_output_table(self):
+        """Only index and `colname` are written to output."""
         with self.output().open() as f:
-            # Only index and `colname` are written to output.
-            return pd.read_csv(f, index_col=0, usecols=(0, self.colname,))
+            return pd.read_csv(f, index_col=0)
 
     def read_input_table(self):
-        with self.input().open() as f:
+        """Read only the columns which will be used."""
+        input = self.input()
+        if hasattr(input, 'keys'):
+            infile = input['table']
+        elif hasattr(input, '__iter__'):
+            infile = input[0]
+        else:
+            infile = input
+
+        with infile.open() as f:
             return pd.read_csv(f, index_col=0, usecols=self.usecols)
 
     def output(self):
+        """Output to`savedir/outname`."""
         return luigi.LocalTarget(os.path.join(self.savedir, self.outname))
 
-    def run(self):
-        raise NotImplementedError('Base class does not implement run method.')
+    run = NotImplemented
 
 
 class TableTransform(TableBase):
@@ -142,24 +158,27 @@ class TableTransform(TableBase):
 class MultipleTableTransform(TableBase):
     """Takes several tables and outputs one table."""
     tables = luigi.Parameter(
-        description='list of tasks that produce the tables to merge')
+        description='collection of tasks that produce the tables to merge')
 
     def requires(self):
         return self.tables
 
 
-class TableMerger(MultipleTableTransform):
-    """Merge multiple DataFrames together."""
-    on = luigi.Parameter(
-        default=None,
-        description='name of column (or csv string of names) to merge on')
+class TableFuncApplier(TableTransform):
+    func = luigi.Parameter(
+        description='function to perform transformation on table')
 
-    def run(self):
-        """Merge all input data frames on the given colname(s)."""
-        on = parse_colnames(self.on)
+    def apply_func(self, table):
+        if self.multiple_columns:
+            othercols = self.cols[1:]
+            if len(othercols) == 1:  # extract single additional column name
+                othercols = othercols[0]
+            self.func(table, self.colname, othercols)
+        else:
+            self.func(table, self.colname)
 
 
-class ColumnScrubber(TableTransform):
+class ColumnScrubber(TableFuncApplier):
     """Infer missing values or clean existing values in a particular column."""
     func = luigi.Parameter(
         description='scrubbing function; operate on table; change values in-place')
@@ -181,14 +200,7 @@ class ColumnScrubber(TableTransform):
         We assume the input table has an index.
         """
         table = self.read_input_table()
-
-        # May or may not have additional columns; functions shouldn't need to be
-        # written to take them, so we multiplex it here.
-        if self.othercols:
-            self.func(table, self.colname, self.othercols)
-        else:
-            self.func(table, self.colname)
-
+        self.apply_func(table)
         with self.output().open('w') as f:
             table.to_csv(f, columns=(self.colname,), index=True)
 
@@ -200,36 +212,33 @@ class ColumnReplacer(TableTransform):
     outname = luigi.Parameter(
         default=None,
         description='table output filename; default is table/replacement name hash')
+    usecols = None  # read all columns from input table
 
     def requires(self):
         return {'table': self.table,
                 'replacement': self.replacement}
 
-    @property
-    def usecols(self):
-        return None  # use all columns
-
-    def read_input_table(self):
-        with self.input()['table'].open() as f:
-            return pd.read_csv(f, index_col=0, usecols=self.usecols)
-
     def output(self):
+        """Either the outname passed or a sha1 hash of a hash of the source
+        table name and a hash of the replacement table name.
+        """
         if self.outname:
-            return luigi.LocalTarget(self.outname)
+            path = os.path.join(self.savedir, self.outname)
         else:
             hashes = ''.join((self.table.thash, self.replacement.thash))
             outname = hashlib.sha1(hashes).hexdigest()
-            return luigi.LocalTarget(outname)
+            path = os.path.join(self.savedir, outname)
+        return luigi.LocalTarget(path)
 
     def run(self):
         """Load `colname` from the `replacement` table and replace the column
-        with `colname` in `table`.
+        with `colname` in `table`. The output includes the entire original table
+        with the single column replaced.
         """
         inputs = self.input()
-        with inputs['table'].open() as f:
-            df = pd.read_csv(f, index_col=0)
+        df = self.read_input_table()
         with inputs['replacement'].open() as f:
-            col = pd.read_csv(f, index_col=0)
+            col = pd.read_csv(f, index_col=0, usecols=(0, self.colname))
 
         # Replace column.
         df[self.colname] = col[self.colname]
@@ -241,14 +250,35 @@ class RowFilterer(TableTransform):
     """Filter the rows of a table; output indices to remove."""
     func = luigi.Parameter(
         description='filtering function; returns indices of rows to remove')
-    colnames = luigi.Parameter(
-        description='columns to be used as filtering criteria')
+    name = luigi.Parameter(
+        description='unique name of the filtering criteria; used for output')
+    outname = luigi.Parameter(
+        default=None,
+        description='output filename; default: input + hash of colnames + filter')
+
+    def output(self):
+        """Either the outname passed or a combination of the input table name,
+        the name of the filtering criterion, and a hash of the colnames:
+            tname-criterionName-hash.
+        """
+        if self.outname:
+            path = os.path.join(self.savedir, self.outname)
+        else:
+            hash = hashlib.sha1(''.join(self.cols)).hexdigest()
+            outname = '-'.join([self.table.tname, hash, self.name])
+            path = os.path.join(self.savedir, outname)
+        return luigi.LocalTarget(path)
 
     def run(self):
         """Load only `colnames` from `fname`. Output indices of rows to be
         removed.
         """
-        pass
+        df = self.read_input_table()
+        indices = self.func(df, self.cols)
+        data = pd.DataFrame({'indices': indices.values})
+
+        with self.output().open('w') as f:
+            data.to_csv(f, index=False)
 
 
 class RowRemover(TableTransform):
@@ -256,15 +286,65 @@ class RowRemover(TableTransform):
     filter_tables = luigi.Parameter(
         description='task that outputs table(s) with indices to remove')
     on = luigi.Parameter(
-        description='index or indices to join `table` and `filter_tables` on')
+        default=None,
+        description='colname for indices; default is index')
+    colnames = None  # no column names necessary
+    usecols = None  # read all columns from input table
+    outname = luigi.Parameter(
+        default=None,
+        description='output filename; default: input-<hash `filter_tables`>')
 
     def requires(self):
         return {'table': self.table,
                 'filter_tables': self.filter_tables}
 
+    def read_indices(self):
+        indices = []
+        for tfile in self.input()['filter_tables']:
+            with tfile.open() as f:
+                # We expect to get an empty data frame; we want its index.
+                idx_table = pd.read_csv(f, index_col=0)
+                indices.append(idx_table.index.values)
+
+        # Combine all indices to remove and get unique indices.
+        return np.unique(np.concatenate(indices))
+
+    @property
+    def indices_to_remove(self):
+        """Cache indices to remove; return from cache."""
+        try:
+            return self._toremove
+        except AttributeError:
+            self._toremove = self.read_indices()
+            return self._toremove
+
+    def output(self):
+        """Either the outname passed or a combination of the input table name
+        and a hash of the filter table names. We would really like to use the
+        indices being removed. Different filtering criteria may actually end up
+        flagging the same indices for removal. This way, the task won't be rerun
+        in that case. However, the complete method needs to know the name of the
+        output file to see if it should generate those very same input files
+        that would contain the indices, so we can't use that method.
+        """
+        if self.outname:
+            path = os.path.join(self.savedir, self.outname)
+        else:
+            inputs = [f.path for f in self.input()['filter_tables']]
+            hash = hashlib.sha1(''.join(inputs)).hexdigest()
+            outname = '-'.join((self.table.tname, hash))
+            path = os.path.join(self.savedir, outname)
+        return luigi.LocalTarget(path)
+
     def run(self):
-        """Load `toremove` table and remove specified rows from `table`."""
-        pass
+        """Load input table, load all indices from `filter_tables`, and combine
+        them, then remove all rows with those index values in the `on` column.
+        """
+        df = self.read_input_table()
+        col = df[self.on] if self.on else df.index
+        df = df[~col.isin(self.indices_to_remove)]
+        with self.output().open('w') as f:
+            df.to_csv(f, index=True)
 
 
 class Cleaner(TableTransform):
@@ -324,6 +404,17 @@ class Cleaner(TableTransform):
     def run(self):
         if not self.remover.complete():
             self.remover.run()
+
+
+class TableMerger(MultipleTableTransform):
+    """Merge multiple DataFrames together."""
+    on = luigi.Parameter(
+        default=None,
+        description='name of column (or csv string of names) to merge on')
+
+    def run(self):
+        """Merge all input data frames on the given colname(s)."""
+        on = parse_colnames(self.on)
 
 
 class FeatureEngineer(TableTransform):
