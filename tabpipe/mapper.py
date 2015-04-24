@@ -6,7 +6,7 @@ import luigi
 import pandas as pd
 
 from util import *
-from core import TableTransform
+from core import TableTransform, ColumnReplacer
 
 
 class ColumnIdMapper(TableTransform):

@@ -53,7 +53,7 @@ import numpy as np
 import luigi
 
 from util import *
-from core import TableTransform, TableFuncApplier
+from core import TableTransform, TableFuncApplier, ColumnReplacer
 
 
 class ColumnScrubber(TableFuncApplier):
@@ -81,47 +81,6 @@ class ColumnScrubber(TableFuncApplier):
         self.apply_func(table)
         with self.output().open('w') as f:
             table.to_csv(f, columns=(self.colname,), index=True)
-
-
-class ColumnReplacer(TableTransform):
-    """Replace one column in a table with another from another table."""
-    replacement = luigi.Parameter(
-        description='task that outputs the table with the replacement column')
-    outname = luigi.Parameter(
-        default=None,
-        description='table output filename; default is table/replacement name hash')
-    usecols = None  # read all columns from input table
-
-    def requires(self):
-        return {'table': self.table,
-                'replacement': self.replacement}
-
-    def output(self):
-        """Either the outname passed or a sha1 hash of a hash of the source
-        table name and a hash of the replacement table name.
-        """
-        if self.outname:
-            path = os.path.join(self.savedir, self.outname)
-        else:
-            hashes = ''.join((self.table.thash, self.replacement.thash))
-            outname = hashlib.sha1(hashes).hexdigest()
-            path = os.path.join(self.savedir, outname)
-        return luigi.LocalTarget(path)
-
-    def run(self):
-        """Load `colname` from the `replacement` table and replace the column
-        with `colname` in `table`. The output includes the entire original table
-        with the single column replaced.
-        """
-        inputs = self.input()
-        df = self.read_input_table()
-        with inputs['replacement'].open() as f:
-            col = pd.read_csv(f, index_col=0, usecols=(0, self.colname))
-
-        # Replace column.
-        df[self.colname] = col[self.colname]
-        with self.output().open('w') as f:
-            df.to_csv(f, index=True)
 
 
 class RowFilterer(TableTransform):
