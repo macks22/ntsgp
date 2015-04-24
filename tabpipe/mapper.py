@@ -2,6 +2,8 @@
 Implement the Mapper subunit.
 
 """
+import os
+
 import luigi
 import pandas as pd
 
@@ -74,19 +76,22 @@ class Mapper(TableTransform):
         default=None,
         description='output filename; default: input-Map<colnames-abbreviated>')
 
+    @property
+    def outpath(self):
+        if self.outname:
+            return os.path.join(self.savedir, self.outname)
+        else:
+            colname_abbrev = abbrev_names(self.cols)
+            outname = '-'.join([self.table.tname, 'Map_%s' % colname_abbrev])
+            return os.path.join(self.savedir, outname)
+
     def output(self):
         """Abbreviate colnames by attempting to take as few of the first few
         letters as necessary to get unique namings. Smash these all together and
         use title casing. So for instance: colnames=('grade', 'gpa', 'rank')
         would produce: MapGrGpRa.
         """
-        if self.outname:
-            path = os.path.join(self.savedir, self.outname)
-        else:
-            colname_abbrev = abbrev_names(self.cols)
-            outname = '-'.join([self.table.tname, 'Map', colname-abbrev])
-            path = os.path.join(self.savedir, outname)
-        return luigi.LocalTarget(path)
+        return luigi.LocalTarget(self.outpath)
 
     def __init__(self, *args, **kwargs):
         """Each column marked for mapping is mapped as follows:
@@ -103,24 +108,31 @@ class Mapper(TableTransform):
         """
         super(Mapper, self).__init__(*args, **kwargs)
 
+        self.idmaps = {}
         self.mapper_tasks = []
         self.subber_tasks = []
         self.replacer_tasks = []
+
+        table_task = self.table
         for colname in self.cols:
             idmapper = ColumnIdMapper(table=self.table, colnames=colname)
-            subber = ValueSubber(table=self.table, idmap=idmapper,
-                                 colnames=colname)
-            replacer = ColumnReplacer(
-                table=self.table, replacement=subber, colnames=colname)
+            self.idmaps[colname] = idmapper.output().path
 
-            self.mapper_tasks.append(mapper)
+            subber = ValueSubber(
+                table=self.table, idmap=idmapper, colnames=colname)
+            replacer = ColumnReplacer(
+                table=table_task, replacement=subber, colnames=colname,
+                outname=self.outpath)
+            table_task = replacer
+
+            self.mapper_tasks.append(idmapper)
             self.subber_tasks.append(subber)
             self.replacer_tasks.append(replacer)
 
         self.final_task = replacer
 
     def run(self):
-        schedule_task(self.final_task)
+        schedule_task(self.final_task, verbose=False)
 
     @property
     def all_tasks(self):

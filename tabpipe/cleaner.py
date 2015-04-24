@@ -248,6 +248,7 @@ class Cleaner(TableTransform):
                 outname=self.outname, on=primary_id)
         else:
             self.final_task = table_task
+            self.final_task.outname = self.outname
 
     @property
     def all_tasks(self):
