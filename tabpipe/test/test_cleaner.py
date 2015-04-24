@@ -4,23 +4,15 @@ import unittest
 
 import pandas as pd
 import numpy as np
-import luigi, luigi.worker
 
 sys.path.append('../')
 from tabpipe import cleaners
 from tabpipe import filters
-from tabpipe.dataproc import (
-    DataTable, ColumnScrubber, ColumnReplacer, RowFilterer, RowRemover, Cleaner
+from tabpipe.util import *
+from tabpipe.core import DataTable
+from tabpipe.cleaner import (
+    ColumnScrubber, ColumnReplacer, RowFilterer, RowRemover, Cleaner
 )
-
-
-def schedule_task(task, verbose=False):
-    if verbose:
-        luigi.interface.setup_interface_logging()
-    sch = luigi.scheduler.CentralPlannerScheduler()
-    w = luigi.worker.Worker(scheduler=sch)
-    w.add(task)
-    w.run()
 
 
 class DataSetupTestCase(unittest.TestCase):
