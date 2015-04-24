@@ -5,7 +5,9 @@ import unittest
 import pandas as pd
 import numpy as np
 
-sys.path.append('../')
+from util import DataSetupTestCase
+
+sys.path.append('../../')
 from tabpipe import cleaners
 from tabpipe import filters
 from tabpipe.util import *
@@ -13,50 +15,6 @@ from tabpipe.core import DataTable
 from tabpipe.cleaner import (
     ColumnScrubber, ColumnReplacer, RowFilterer, RowRemover, Cleaner
 )
-
-
-class DataSetupTestCase(unittest.TestCase):
-    """Includes basic data set up and clean up methods."""
-
-    dfiles = []  # list of string, to save data tables to
-    data_sources = []  # list of dictionaries, to be converted to DataFrames
-    task = None
-
-    @classmethod
-    def dtables(cls):
-        return [DataTable(dfile) for dfile in cls.dfiles]
-
-    @classmethod
-    def iter_sources(cls):
-        for item in zip(cls.dfiles, cls.data_sources):
-            yield item
-
-    @classmethod
-    def setUpClass(cls):
-        """Write DataFrame to be used for testing."""
-        if len(cls.data_sources) != len(cls.dfiles):
-            raise ValueError("More data files than data sources.")
-
-        for fname, data in cls.iter_sources():
-            df = pd.DataFrame(data)
-            df.to_csv(fname, index=True)
-
-    @classmethod
-    def tearDownClass(cls):
-        """Delete csv file written in set up."""
-        for dfile in cls.dfiles:
-            try:
-                os.remove(dfile)
-            except OSError:
-                pass
-
-    def tearDown(self):
-        """Delete any files written by tasks during testing."""
-        if self.task:
-            try:
-                os.remove(self.task.output().path)
-            except OSError:
-                pass
 
 
 class TestColumnScrubber(DataSetupTestCase):
@@ -110,39 +68,6 @@ class TestColumnScrubber(DataSetupTestCase):
             mask = mask | (df[colname].str.endswith(char))
 
         self.assertEqual(mask.sum(), 0)
-
-
-class TestColumnReplacer(DataSetupTestCase):
-    """Test ColumnReplacer Task."""
-
-    dfile = 'column-replacer-test-file.csv'
-    replace_file = 'replacement-column.csv'
-    dfiles = [dfile, replace_file]
-
-    data_sources = [
-        {'name': [' John ', 'Jack ', 'Jill ', 'Sally'],
-         'age': [21, np.nan, 15, 47],
-         'zip': [22030, 22030, 15354, np.nan]},
-        {'name': ['001', '002', '003', '004']}
-    ]
-
-    def test_replace_column(self):
-        """Replace a column."""
-        colname = 'name'
-        dtable, rtable = self.dtables()
-        self.task = ColumnReplacer(
-            table=dtable, replacement=rtable, colnames=colname)
-        df_before = self.task.read_input_table()
-        self.task.run()
-
-        # Now all values in the name column should be equal to those in the name
-        # column of the replacement table.
-        df = self.task.read_output_table()
-        with self.task.input()['replacement'].open() as f:
-            rdf = pd.read_csv(f, index_col=0)
-
-        check = (df[colname] == rdf[colname])
-        self.assertTrue(check.all())
 
 
 class TestRowCleaning(DataSetupTestCase):
