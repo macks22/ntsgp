@@ -51,7 +51,16 @@ import hashlib
 import pandas as pd
 import numpy as np
 import luigi
+import luigi.worker
 
+
+def schedule_task(task, verbose=False):
+    if verbose:
+        luigi.interface.setup_interface_logging()
+    sch = luigi.scheduler.CentralPlannerScheduler()
+    w = luigi.worker.Worker(scheduler=sch)
+    w.add(task)
+    w.run()
 
 
 def parse_colnames(thing):
@@ -350,12 +359,14 @@ class RowRemover(TableTransform):
 class Cleaner(TableTransform):
     """Fill rows, replace columns, filter rows, remove rows, output."""
     scrubbers = luigi.Parameter(
-        description='list of dict: `colname`, `othercols`, `func` (see ColumnScrubber)')
+        default=[],  # may not need any scrubbers
+        description='list of dict: `colnames`, `func` (see ColumnScrubber)')
     filterers = luigi.Parameter(
+        default=[],  # may not need any filterers
         description='list of dict: `name`, `colnames`, `func` (see RowFilterer)')
     primary_id = luigi.Parameter(
         description='colname of primary id, or csv string of colnames, or tuple')
-
+    colnames = None
 
     def __init__(self, *args, **kwargs):
         super(Cleaner, self).__init__(*args, **kwargs)
@@ -364,46 +375,67 @@ class Cleaner(TableTransform):
         primary_id = parse_colnames(self.primary_id)
 
         # Create scrubbers and replacers.
-        self.filler_tasks = []
+        self.scrubber_tasks = []
         self.replacer_tasks = []
         table_task = self.table
         for spec in self.scrubbers:
             # Output name is combo of original table name, colname being
             # being filled, and the word fill.
             spec['table'] = self.table
-            filler_task = ColumnScrubber(**spec)
+            scrubber_task = ColumnScrubber(**spec)
 
             # Replacer tasks operate in a pipeline fashion; the first one
             # takes the original table, the second takes the table output from
             # the last one, and so on until the final column replacement
             # produces the table that gets passed into the row filterers.
             replacer_task = ColumnReplacer(
-                table=table_task, replacement=filler_task,
-                colname=spec['colname'])
+                table=table_task, replacement=scrubber_task,
+                colnames=spec['colnames'])
             table_task = replacer_task
 
-            self.filler_tasks.append(filler_task)
+            self.scrubber_tasks.append(scrubber_task)
             self.replacer_tasks.append(replacer_task)
+
+        # If we have no scrubber tasks, the input dtable is still the table
+        # we're working with.
+        table_task = replacer_task if self.scrubbers else self.table
 
         self.row_filterers = []
         for spec in self.filterers:
             # Output name is combo of last column replacer output name and
             # the filter criteria name.
-            parts = (replacer_task.table_name, spec['name'])
+            parts = (table_task.tname, spec['name'])
             spec['outname'] = '-'.join(parts)
             spec['table'] = replacer_task
             self.row_filterers.append(RowFilterer(**spec))
 
-        # The remover is the final step in the Cleaner pipeline. All indices
-        # marked for removal are combined and those rows are removed from the
-        # table from the last column replacer. This is the final output.
-        self.remover = RowRemover(
-            table=replacer_task, filter_tables=self.row_filterers,
-            outname=self.outname, on=primary_id)
+        # If we have no filtering tasks, the current dtable is the table from
+        # the last replacer, otherwise it's the table from the remover.
+        if self.filterers:
+            # All indices marked for removal are combined and those rows are
+            # removed from the table from the last column replacer. This is the
+            # final output.
+            self.final_task = RowRemover(
+                table=replacer_task, filter_tables=self.row_filterers,
+                outname=self.outname, on=primary_id)
+        else:
+            self.final_task = table_task
+
+    def delete_intermediates(self):
+        """Delete all intermediate output files."""
+        all_tasks = \
+            self.scrubber_tasks + self.replacer_tasks + self.row_filterers
+        if self.filterers:
+            all_tasks.append(self.final_task)
+
+        for task in all_tasks:
+            try:
+                os.remove(task.output().path)
+            except OSError:
+                pass
 
     def run(self):
-        if not self.remover.complete():
-            self.remover.run()
+        schedule_task(self.final_task, verbose=False)
 
 
 class TableMerger(MultipleTableTransform):

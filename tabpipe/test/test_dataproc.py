@@ -10,11 +10,11 @@ sys.path.append('../')
 from tabpipe import cleaners
 from tabpipe import filters
 from tabpipe.dataproc import (
-    DataTable, ColumnScrubber, ColumnReplacer, RowFilterer, RowRemover
+    DataTable, ColumnScrubber, ColumnReplacer, RowFilterer, RowRemover, Cleaner
 )
 
 
-def run_task(task, verbose=False):
+def schedule_task(task, verbose=False):
     if verbose:
         luigi.interface.setup_interface_logging()
     sch = luigi.scheduler.CentralPlannerScheduler()
@@ -232,7 +232,7 @@ class TestRowRemover(TestRowCleaning):
         ]
         self.task = RowRemover(
             table=dtable, filter_tables=filter_tables)
-        run_task(self.task)
+        schedule_task(self.task)
 
         # All rows with nan values in `missing` col and numeric values < -10 or
         # > 10 in `numeric` column should now be gone.
@@ -258,9 +258,61 @@ class TestRowRemover(TestRowCleaning):
                 pass
 
 
-class TestCleaner(unittest.TestCase):
+class TestCleaner(DataSetupTestCase):
     """Test Cleaner Task."""
-    pass
+
+    dfile = 'cleaner-test-file.csv'
+    dfiles = [dfile]
+
+    data_sources = [{
+        # provide a useful joining column that is not the index
+        'id': np.arange(10),
+        # missing values that need to be filled
+        'gpa': np.array([np.nan, 1, 2, np.nan, 4, 0, 1, np.nan, 3, np.nan]),
+        # another column to fill missing values with
+        'grade': np.array(['F', 'D', 'C', 'B', 'A', 'F', 'D', 'C', 'B', 'A']),
+        # numeric bounds filtering
+        'hsgpa': np.array([3.5, 2.0, 2.5, 2.75, 4.0, 1200, -13.3, 4.3, 1.5, 5.0])
+    }]
+
+    def test_cleaning_student_data(self):
+        """Run cleaning process on student data."""
+        bounds = (0, 5)
+        self.task = Cleaner(
+            table=self.dtables()[0], outname='cleaned-student-data.csv',
+            scrubbers = [
+                {'colnames': ['gpa', 'grade'],
+                 'func': cleaners.fill_nan_with_2col_1to1_map}
+            ],
+            filterers = [
+                {'name': 'bound-hsgpa',
+                 'colnames': 'hsgpa',
+                 'func': lambda df, colns: \
+                     filters.filter_to_numeric_range(df, colns, bounds)}
+            ],
+            primary_id = 'id'
+        )
+        self.task.run()
+        df = self.task.read_output_table()
+
+        source = self.data_sources[0]
+        mask = (source['hsgpa'] < bounds[0]) | (source['hsgpa'] > bounds[1])
+        indices_removed = mask.nonzero()[0]
+
+        check1 = df.index.isin(indices_removed)
+        self.assertFalse(check1.any())
+
+        gpacol = [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]  # nan values filled
+        indices_removed.sort()
+        for idx in indices_removed:
+            gpacol.pop(idx)
+            indices_removed -= 1
+
+        gpacol = np.array(gpacol)
+        check2 = (df['gpa'] == gpacol)
+        self.assertTrue(check2.all())
+
+        self.task.delete_intermediates()
 
 
 if __name__ == "__main__":
