@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.append('../../')
 from tabpipe.util import *
-from tabpipe.core import DataTable, ColumnReplacer
+from tabpipe.core import DataTable, ColumnReplacer, TableMerger
 
 from util import DataSetupTestCase
 
@@ -42,6 +42,48 @@ class TestColumnReplacer(DataSetupTestCase):
 
         check = (df[colname] == rdf[colname])
         self.assertTrue(check.all())
+
+
+class TestTableMerger(DataSetupTestCase):
+    """Test TableMerger Task."""
+
+    dfiles = ['table%d' % i for i in range(3)]
+
+    data_sources = [
+        {'id': [0, 1, 2, 3, 4],
+         'sat': [1250, 1200, 1000, 1600, 800]},
+        {'id': [0, 1, 2, 5, 6],
+         'gpa': [3.0, 3.0, 2.0, 4.0, 1.5]},
+        {'id': [0, 0, 1, 1, 2],
+         'cid': [0, 1, 0, 1, 0]}
+    ]
+
+    def test_merge_3_tables_same_id(self):
+        """Merge 3 tables on the same, non-index id."""
+        dt1, dt2, dt3 = self.dtables()
+        idname = 'id'
+        self.task = TableMerger(
+            tables=[
+                {'table': dt1, 'id': idname},
+                {'table': dt2, 'id': idname},
+                {'table': dt3, 'id': idname}
+            ],
+            outname='student-data.csv'
+        )
+        self.task.run()
+        df = self.task.read_output_table()
+
+        # Make sure all columns ended up in final table.
+        colnames = np.array(['sat', 'gpa', 'cid', 'id'])
+        check1 = np.in1d(colnames, df.columns.values)
+        self.assertTrue(check1.all())
+
+        # Make sure all ids are represented.
+        ids = reduce(lambda x,y: x + y,
+                     [src['id'] for src in self.data_sources])
+        ids = np.array(list(set(ids)))
+        check2 = np.in1d(ids, df[idname].values)
+        self.assertTrue(check2.all())
 
 
 if __name__ == "__main__":

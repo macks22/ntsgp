@@ -4,6 +4,8 @@ import hashlib
 import luigi
 import pandas as pd
 
+from util import *
+
 
 class TableMixin(object):
     """Useful table properties."""
@@ -98,6 +100,9 @@ class MultipleTableTransform(TableBase):
     """Takes several tables and outputs one table."""
     tables = luigi.Parameter(
         description='collection of tasks that produce the tables to merge')
+    read_input_table = None
+    colnames = None
+    colname = None
 
     def requires(self):
         return self.tables
@@ -156,4 +161,56 @@ class ColumnReplacer(TableTransform):
         df[self.colname] = col[self.colname]
         with self.output().open('w') as f:
             df.to_csv(f, index=True)
+
+
+class TableMerger(MultipleTableTransform):
+    """Merge multiple DataFrames together."""
+    # Each entry in the `tables` dicts should contain at least the task that
+    # yields the input table. The colnames are optional; this will read only
+    # those columns of the table, in addition to `id` if it is passed. `id`
+    # specifies the column name to use for merging; if none is specified, the
+    # index is used.
+    tables = luigi.Parameter(
+        description='List of dict: `table`, `colnames`, `id`')
+
+    def requires(self):
+        return [spec['table'] for spec in self.tables]
+
+    def read_table(self, table, colnames=None, id=None):
+        tfile = table.output()
+        with tfile.open() as f:
+            if colnames:
+                if id:
+                    colnames.append(id)
+                colnames.insert(0, 0)  # read index
+                usecols = list(set(colnames))
+            else:
+                usecols=None
+            return pd.read_csv(f, usecols=usecols, index_col=0)
+
+    def run(self):
+        """Merge all input data frames on the given colname(s)."""
+        if len(self.tables) <= 1:
+            raise ValueError("Need at least two tables to merge.")
+
+        for spec in self.tables:
+            spec['id'] = None if not 'id' in spec else spec['id']
+
+        tables = [(self.read_table(**spec), spec['id'])
+                  for spec in self.tables]
+
+        # Replace current table with merge on last table, then replace current
+        # list index with merged table.
+        for tnum in range(len(tables))[1:]:
+            left, lid = tables[tnum-1]
+            right, rid = tables[tnum]
+            lidx = not bool(lid)  # False if not None
+            ridx = not bool(rid)  # False if not None
+            merged = left.merge(right, how='outer',
+                                left_on=lid, right_on=rid,
+                                left_index=lidx, right_index=ridx)
+            tables[tnum] = (merged, rid)
+
+        with self.output().open('w') as f:
+            merged.to_csv(f, index=True)
 
