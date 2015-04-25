@@ -20,6 +20,21 @@ class TableMixin(object):
         return hashlib.sha1(self.tname).hexdigest()
 
 
+class TableOutputter(luigi.Task):
+    """Useful things for tasks that output tables."""
+    outname = luigi.Parameter(
+        description='filename to output transformed table to')
+
+    def output(self):
+        """Output to`savedir/outname`."""
+        return luigi.LocalTarget(os.path.join(self.savedir, self.outname))
+
+    def read_output_table(self):
+        """Only index and `colname` are written to output."""
+        with self.output().open() as f:
+            return pd.read_csv(f, index_col=0)
+
+
 class DataTable(luigi.ExternalTask, TableMixin):
     """Wraps up external source files for data tables."""
     fname = luigi.Parameter(description='filename for data table')
@@ -32,15 +47,13 @@ class DataTable(luigi.ExternalTask, TableMixin):
         return luigi.LocalTarget(self.fname)
 
 
-class TableBase(luigi.Task, TableMixin):
+class TableBase(TableOutputter):
     """Miscellaneous table manipulation methods."""
     savedir = luigi.Parameter(
         default='',
         description='directory to save data files to; default is cwd')
     colnames = luigi.Parameter(
-        description='name of column to scrub is first, then any others')
-    outname = luigi.Parameter(
-        description='filename to output transformed table to')
+        description='name or names of columns to use')
 
     @property
     def multiple_columns(self):
@@ -62,11 +75,6 @@ class TableBase(luigi.Task, TableMixin):
         """Main colname to use for table output and function input."""
         return self.colnames[0] if self.multiple_columns else self.colnames
 
-    def read_output_table(self):
-        """Only index and `colname` are written to output."""
-        with self.output().open() as f:
-            return pd.read_csv(f, index_col=0)
-
     def read_input_table(self):
         """Read only the columns which will be used."""
         input = self.input()
@@ -79,10 +87,6 @@ class TableBase(luigi.Task, TableMixin):
 
         with infile.open() as f:
             return pd.read_csv(f, index_col=0, usecols=self.usecols)
-
-    def output(self):
-        """Output to`savedir/outname`."""
-        return luigi.LocalTarget(os.path.join(self.savedir, self.outname))
 
     run = NotImplemented
 

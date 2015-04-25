@@ -28,39 +28,42 @@ class TestValueSubber(DataSetupTestCase):
 class TestMapper(DataSetupTestCase):
     """Test the Mapper Task."""
 
-    dfile = 'cleaner-test-file.csv'
-    dfiles = [dfile]
+    dfiles = ['cleaner-test-file.csv']
 
     data_sources = [{
         'grade': np.array(['A', 'B', 'C', 'A', 'B', 'C','F']),
         'status': np.array(['UG', 'UG', 'UG', 'UG', 'GRAD', 'GRAD', 'GRAD']),
-        'id': np.random.choice(np.arange(10, 100), replace=False, size=7)
+        'id': np.array([10, 20, 30, 51, 98, 27, 7])
     }]
 
     def test_mapper_basic_case(self):
         """Test mapper for 2 string columns and one int column."""
         self.task = Mapper(
             table=self.dtables()[0],
-            colnames=('grade', 'status', 'id'))
+            maps = {'gradepts': ['grade'],
+                    'sid': ['status'],
+                    'id': ['id']}
+        )
         self.task.run()
         df = self.task.read_output_table()
+        self.task.delete_intermediates()
 
         # First column mapping; single character mapping.
-        grades = np.array([0, 1, 2, 0, 1, 2, 3])
-        check1 = (grades == df['grade'])
+        src = self.data_sources[0]
+        gmap = {'A': 0, 'B': 1, 'C': 2, 'F': 3}
+        grades = np.array([gmap[grade] for grade in src['grade']])
+        check1 = (grades == df['gradepts'])
         self.assertTrue(check1.all())
 
         # Second column mapping; word mapping.
         status = np.array([0, 0, 0, 0, 1, 1, 1])
-        check2 = (status == df['status'])
+        check2 = (status == df['sid'])
         self.assertTrue(check2.all())
 
         # Third column; numeric -> numeric.
         ids = np.array([0, 1, 2, 3, 4, 5, 6])
         check3 = (ids == df['id'])
         self.assertTrue(check3.all())
-
-        self.task.delete_intermediates()
 
 
 if __name__ == "__main__":
