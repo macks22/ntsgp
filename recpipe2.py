@@ -25,7 +25,7 @@ class PreprocessedData(BasicLuigiTask):
     """Loads in preprocessed course data."""
     def run(self):
         with self.output().open('w') as f:
-            self.cvals, self.rvals = preprocess(f)
+            preprocess(f)
 
 
 class TrainTestFilter(object):
@@ -72,6 +72,9 @@ class UsesTrainTestSplit(luigi.Task):
     remove_cold_start = luigi.IntParameter(
         default=1,
         description="remove all cold-start records from test set")
+    useall = luigi.BoolParameter(
+        default=False,
+        description='use all possible features')
 
     base = 'data'  # directory to write files to
     ext = 'tsv'    # final file extension for output files
@@ -89,11 +92,13 @@ class UsesTrainTestSplit(luigi.Task):
 
     @property
     def cvals(self):
-        return [cval for cval in CVALS if getattr(self, cval)]
+        return (CVALS if self.useall else
+                [cval for cval in CVALS if getattr(self, cval)])
 
     @property
     def rvals(self):
-        return [rval for rval in RVALS if getattr(self, rval)]
+        return (RVALS if self.useall else
+                [rval for rval in RVALS if getattr(self, rval)])
 
     @property
     def features(self):
@@ -141,9 +146,6 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
     def split_data(self):
         with self.input().open() as f:
             data = pd.read_csv(f)
-
-        # sort data by term number, then by student id
-        data = data.sort(['termnum', 'sid'])
 
         # now do train/test split; drop duplicates in case filters overlap
         train = pd.concat([f.train(data) for f in self.filters]).drop_duplicates()
@@ -198,7 +200,8 @@ class LibFMAllTermInput(DataSplitterBaseTask):
         # Due to the backfilling, we must rely on the train filters to get the
         # last term in the training data.
         start = max([f.cohort_end for f in self.filters])
-        end = int(self.test[~self.test.cohort.isnull()].cohort.max())
+        cohorts = self.test.cohort.values
+        end = int(np.nanmax(cohorts)) if len(cohorts) else 0
         return range(start + 1, end + 1)
 
     def handle_cold_start(self, test):
@@ -263,7 +266,7 @@ class LibFMNextTermInput(LibFMAllTermInput):
         for termnum in self.term_range:  # includes (end term + 1)
             test = self.test[self.test.termnum == termnum]
 
-            # remove cold start recordsif requested
+            # remove cold start records if requested
             test = self.handle_cold_start(test)
 
             for name, dataset in zip(['train', 'test'], [self.train, test]):

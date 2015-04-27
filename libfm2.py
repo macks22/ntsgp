@@ -55,8 +55,8 @@ class UsesLibFM(UsesTrainTestSplit):
         if self.use_bias:
             parts.append('b')
 
-        if self.subtask_class.featnames:
-            parts.append(self.subtask_class.featnames)
+        if self.subtask.featnames:
+            parts.append(self.subtask.featnames)
 
         return parts
 
@@ -179,9 +179,9 @@ class RunLibFM(UsesLibFM):
             predicted = self.libfm_predict(train, test, outfile)
 
             # Now calculate absolute deviation of predictions from actuals
+            # Get actual values by reading targets from libfm test files.
             with test_file.open() as f:
-                test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
-                test = test.values[:,0]
+                test = np.array([l.split()[0] for l in f], dtype=np.float)
 
             error[termnum] = abs(predicted - test) ** 2
 
