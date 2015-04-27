@@ -2,6 +2,17 @@
 Useful utility functions.
 
 """
+import luigi
+import luigi.worker
+
+
+def schedule_task(task, verbose=False):
+    if verbose:
+        luigi.interface.setup_interface_logging()
+    sch = luigi.scheduler.CentralPlannerScheduler()
+    w = luigi.worker.Worker(scheduler=sch)
+    w.add(task)
+    w.run()
 
 
 def abbrev_names(names, nletters=3):
