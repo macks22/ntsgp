@@ -7,122 +7,112 @@ import numpy as np
 import pandas as pd
 
 import test_params
+from util import *
+from writer import *
 
 
-class LuigiDataFile(luigi.Task):
+MAX_NUM_COHORTS = 14
+
+
+class LuigiDataFile(luigi.ExternalTask):
     """Class to access files that already exist (no processing needed)."""
     data_fname = 'placeholder'
-
     def output(self):
         return luigi.LocalTarget(os.path.join('data', self.data_fname))
-
-
-class StudentData(LuigiDataFile):
-    data_fname = 'nsf_student.csv'
-
-class AdmissionsData(LuigiDataFile):
-    data_fname = 'nsf_admissions.csv'
-
-class DegreesData(LuigiDataFile):
-    data_fname = 'nsf_degrees.csv'
-
-class CoursesData(LuigiDataFile):
-    data_fname = 'nsf_courses.csv'
-
-
-def fname_from_cname(cname):
-    words = []
-    chars = [cname[0]]
-    for c in cname[1:]:
-        if c.isupper():
-            words.append(''.join(chars))
-            chars = [c]
-        else:
-            chars.append(c)
-
-    words.append(''.join(chars))
-    return '-'.join(map(lambda s: s.lower(), words))
 
 
 class BasicLuigiTask(luigi.Task):
     """Uses class name as output file."""
     ext = 'csv'
-
     def output(self):
         fname = fname_from_cname(self.__class__.__name__)
         return luigi.LocalTarget(os.path.join(
             'data', '%s.%s' % (fname, self.ext)))
 
 
-class StudentIdMap(BasicLuigiTask):
-    """Produce a contiguous id mapping for all students."""
-
-    ids = ['id']
-
-    def requires(self):
-        return CoursesData()
+class BuildIdMap(BasicLuigiTask):
+    """Produce a contiguous id mapping for all ids."""
+    ids = []
 
     def run(self):
         with self.input().open() as f:
-            courses = pd.read_csv(f)
+            data = pd.read_csv(f)
 
-        students = courses[self.ids].drop_duplicates().reset_index()[self.ids]
-        with self.output().open('w') as f:
-            students.to_csv(f, header='id', index_label='index', float_format='%.0f')
+        # prevent ids from being written as floats when we have nan values.
+        isfloat = \
+            [data[colname].apply(lambda val: isinstance(val, np.float)).any()
+             for colname in self.ids]
+        have_floats = np.array(isfloat).any()
+        float_fmt = '%.6f' if have_floats else '%.0f'
 
-
-class CourseIdMap(BasicLuigiTask):
-    """Produce a contiguous id mapping for all courses (DISC, CNUM, HRS)."""
-
-    ids = ['DISC', 'CNUM', 'HRS']
-
-    def requires(self):
-        return CoursesData()
-
-    def run(self):
-        with self.input().open() as f:
-            courses = pd.read_csv(f)
-
-        # Get all unique courses, as specified by (DISC, CNUM, HRS).
-        # we assume here that some courses have labs/recitations which
-        # have the same (DISC, CNUM) but different number of HRS.
-        triplets = courses[self.ids].drop_duplicates().reset_index()[self.ids]
+        # Map sorted values to contiguous numerical indices.
+        idmap = data[self.ids].sort(self.ids)\
+                              .drop_duplicates()\
+                              .reset_index()[self.ids]
         with self.output().open('w') as out:
-            triplets.to_csv(out, index_label='index')
+            idmap.to_csv(out, index_label='index', float_format=float_fmt)
 
 
-class InstructorIdMap(BasicLuigiTask):
-    """Produce a contiguous id mapping for all instructors (LANME, FNAME)."""
+# All external data files.
+DATA_SOURCES = {
+    'courses': 'nsf_courses.csv',
+    'students': 'nsf_student.csv',
+    'demographics': 'nsf_demographics.csv',
+    'admissions': 'nsf_admissions.csv',
+    'degrees': 'nsf_degrees.csv'
+}
 
-    ids = ['INSTR_LNAME', 'INSTR_FNAME']
-
-    def requires(self):
-        return CoursesData()
-
-    def run(self):
-        with self.input().open() as f:
-            courses = pd.read_csv(f)
-
-        instr = courses[self.ids].drop_duplicates().reset_index()[self.ids]
-        with self.output().open('w') as out:
-            instr.to_csv(out, index_label='index', float_format='%.0f')
+# Build data source tasks; dynamically create class for each data source.
+# After creation, place in new map, from source name to production task.
+DATA_TASKS = {}
+for src_name, fname in DATA_SOURCES.items():
+    class_name = '%s%sData' % (src_name[0].upper(), src_name[1:])
+    globals()[class_name] = \
+        type(class_name, (LuigiDataFile,), {'data_fname': fname})
+    DATA_TASKS[src_name] = globals()[class_name]
 
 
-class OrdinalTermMap(BasicLuigiTask):
-    """Produce an ordinal mapping (0...) for enrollment terms."""
+# WARNING: Does not currently support mapping to same colname!
+IDMAPS = {
+    'courses': {
+        'sid': ['id'],
+        'cid': ['DISC', 'CNUM', 'HRS'],
+        'iid': ['INSTR_LNAME', 'INSTR_FNAME'],
+        'termnum': ['TERMBNR'],
+        'iclass': ['class'],
+        'irank': ['instr_rank'],
+        'itenure': ['instr_tenure'],
+        'cdisc': ['DISC']
+    },
+    'demographics': {
+        'srace': ['race'],
+        'sex': ['SEX']
+    },
+    'students': {
+        'major': ['PMAJR']
+    },
+    'admissions': {
+        'zip': ['Permanent_Address_ZIP'],
+        'hs': ['HS_CEEB_Code']
+    },
+    'degrees': {}
+}
 
-    ids = ['TERMBNR']
-
-    def requires(self):
-        return CoursesData()
-
-    def run(self):
-        with self.input().open() as f:
-            courses = pd.read_csv(f)
-
-        terms = courses[self.ids].drop_duplicates().reset_index()[self.ids]
-        with self.output().open('w') as out:
-            terms.to_csv(out, index_label='index', float_format='%.0f')
+# Build id-mapping tasks at global scope.
+IDMAP_TASKS = {}
+for src_name, mapdict in IDMAPS.items():
+    data_task = DATA_TASKS[src_name]
+    base_name = '%s%s' % (src_name[0].upper(), src_name[1:])
+    for attr, cols in mapdict.items():
+        instance = data_task()
+        # print src_name, attr, ','.join(cols), data_task, instance.output().path
+        class_name = '%s%s%sMap' % (base_name, attr[0].upper(), attr[1:])
+        globals()[class_name] = type(
+            class_name, (BuildIdMap,),
+            {'ids': cols,
+             'reqtask': data_task,
+             'requires': lambda self: self.reqtask()})
+        IDMAP_TASKS[attr] = globals()[class_name]
 
 
 # Alphabetical grade to quality points
@@ -156,16 +146,92 @@ grade2pts = {
 }
 
 
-class PreprocessedCourseData(BasicLuigiTask):
+def use_idmap(df, idmap, newname, oldcols, remove=False):
+    """Use the given idmap to create a column with `newname` in the `df` by
+    merging on `oldcols`.
+    """
+    tmpname = '_new_%s' % newname
+    idmap[tmpname] = idmap.index
+    df = df.merge(idmap, how='left', left_on=newname, right_on=oldcols)
+    df[newname] = df[tmpname]
+    del df[tmpname]
+    if remove:
+        for colname in oldcols:
+            del df[colname]
+    return df
+
+
+def map_ids(df, idname, remove=False):
+    """Map the set-categorical values in the df to numerical indices. Adds a new
+    column to the DataFrame and returns the new frame. Optionally removes the
+    columns used to produce the mapping. `idname` is the name of the new column
+    which will contain the mapped values. This should be present in IDMAPS.
+    """
+    # Lookup id-mapping class in global table.
+    klass = IDMAP_TASKS[idname]
+    task = klass()
+
+    # Shouldn't really need this here.
+    if not task.complete():
+        task.run()
+
+    # Load idmap from file.
+    with task.output().open() as f:
+        idmap = pd.read_csv(f, index_col=0)
+
+    # Create tmp column to store new column.
+    tmpname = '_new_%s' % idname
+    idmap[tmpname] = idmap.index
+
+    # Ensure data types match up after merge.
+    for colname in klass.ids:
+        dtype = df[colname].dtype.type
+        idmap[colname] = idmap[colname].values.astype(dtype)
+
+    # Move values from tmp column to `idname` column and delete tmp.
+    df = df.merge(idmap, how='left', on=klass.ids)
+    df[idname] = df[tmpname]
+    del df[tmpname]
+
+    # Remove columns used to create mapping, if requeseted.
+    if remove:
+        for colname in klass.ids:
+            del df[colname]
+
+    return df
+
+
+def extract_clevel(cnum):
+    """Extract the course level from the course number."""
+    if cnum == np.nan:
+        return np.nan
+    cnum = str(cnum).strip()
+    if not cnum:
+        return np.nan
+    digits = filter(lambda c: c.isdigit(), cnum)
+    if not digits:
+        return np.nan
+    return digits[0]
+
+
+class PreprocessedData(BasicLuigiTask):
     """Clean up courses data to prepare for learning tasks."""
 
+    attributes = {
+        'sid': 1, 'cdisc': 0, 'cid': 0, 'iid': 1, 'termnum': 1,
+        'iclass': 1, 'irank': 1, 'itenure': 1, 'zip': 1, 'hs': 1,
+        'major': 1, 'srace': 1, 'sex': 1
+    }
+    cvals = attributes.keys()
+    rvals = ['grdpts', 'age', 'hsgpa', 'sat', 'chrs', 'clevel']
+    data_tasks = {src_name: task() for src_name, task in DATA_TASKS.items()}
+    idmap_classes = [IDMAP_TASKS[attr] for attr in cvals]
+    idmap_tasks = {klass.__name__: klass() for klass in idmap_classes}
+
     def requires(self):
-        return {'courses': CoursesData(),
-                'admissions': AdmissionsData(),
-                'StudentIdMap': StudentIdMap(),
-                'CourseIdMap': CourseIdMap(),
-                'InstructorIdMap': InstructorIdMap(),
-                'OrdinalTermMap': OrdinalTermMap()}
+        sources = self.data_tasks.copy()
+        sources.update(self.idmap_tasks)
+        return sources
 
     @property
     def grade2pts(self):
@@ -181,65 +247,78 @@ class PreprocessedCourseData(BasicLuigiTask):
             return series['grdpts']
 
     def run(self):
+        courses_cols = ['id', 'TERMBNR', 'DISC', 'CNUM', 'GRADE', 'HRS',
+                        'grdpts', 'INSTR_LNAME', 'INSTR_FNAME', 'class',
+                        'instr_rank', 'instr_tenure']
         with self.input()['courses'].open() as f:
-            courses = pd.read_csv(f)
+            courses = pd.read_csv(f, usecols=courses_cols)
 
         # fill in missing values for quality points
         courses.grdpts = courses.apply(self.fill_grdpts, axis=1)
 
-        def map_ids(input_name, idname):
-            klass = globals()[input_name]
-            with self.input()[input_name].open() as f:
-                idmap = pd.read_csv(f, index_col=0)
+        # Get course level from CNUM.
+        courses['clevel'] = courses['CNUM'].apply(extract_clevel)
 
-            idmap[idname] = idmap.index
-            cols = list(courses.columns.values) + [idname]
-            for col_name in klass.ids:
-                cols.remove(col_name)
+        # add student data first.
+        students_cols = ['id', 'cohort', 'TERMBNR', 'PMAJR', 'termgpa',
+                         'term_earn_hrs', 'cumgpa']
+        with self.input()['students'].open() as f:
+            students = pd.read_csv(f, usecols=students_cols)
 
-            for col_name in klass.ids:
-                dtype = courses[col_name].dtype.type
-                idmap[col_name] = idmap[col_name].values.astype(dtype)
-            return courses.merge(idmap, how='left', on=klass.ids)[cols]
+        data = courses.merge(students, how='left', on=('id', 'TERMBNR'))
 
-        # add student cohorts to data frame
+        # add demographics data next
+        with self.input()['demographics'].open() as f:
+            demog = pd.read_csv(f)
+
+        data = data.merge(demog, how='left', on='id')
+
+        # add admissions data to data frame
+        admiss_cols = ['id', 'cohort', 'Permanent_Address_ZIP', 'HSGPA',
+                       'SAT_Total_1600', 'HS_CEEB_Code']
         with self.input()['admissions'].open() as f:
-            admiss = pd.read_csv(f, usecols=(0,1))
+            admiss = pd.read_csv(f, usecols=admiss_cols)
 
-        with self.input()['OrdinalTermMap'].open() as f:
+        with self.input()['CoursesTermnumMap'].open() as f:
             idmap = pd.read_csv(f, index_col=0)
 
-        admiss.columns = ['id', 'TERMBNR']
-        idmap['cohort'] = idmap.index
-        admiss = admiss.merge(idmap, how='left', on='TERMBNR')
-        del admiss['TERMBNR']
-        courses = courses.merge(admiss, how='left', on='id')
+        # Map cohort column values to numerical index.
+        admiss = use_idmap(
+            admiss, idmap, 'cohort', oldcols=['TERMBNR'], remove=True)
+        data = data.merge(admiss, how='left', on=('id', 'cohort'))
 
         # Replace course, student, instructor and term identifiers with
         # contiguous id mappings
-        idmap = {'CourseIdMap': 'cid',
-                 'StudentIdMap': 'sid',
-                 'InstructorIdMap': 'iid',
-                 'OrdinalTermMap': 'termnum'}
+        for idname, remove_flag in self.attributes.items():
+            data = map_ids(data, idname, remove=remove_flag)
 
-        for map_klass, idname in idmap.items():
-            courses = map_ids(map_klass, idname)
+        # remove unneeded columns not deleted during mapping procedure
+        unneeded = ['DISC', 'CNUM']
+        for colname in unneeded:
+            del data[colname]
 
-        # remove unneeded columns
-        unneeded = ['CRN', 'SECTNO', 'TITLE',
-                    'class', 'instr_rank', 'instr_tenure']
-        for col_name in unneeded:
-            del courses[col_name]
+        data.rename(columns={
+            'HSGPA': 'hsgpa',
+            'SAT_Total_1600': 'sat',
+            'HRS': 'chrs',
+            'ENTRY_AGE': 'age'
+        }, inplace=True)
 
-        # Write cleaned up courses data.
+        # remove records for missing grades
+        data = data[~data['grdpts'].isnull()]
+
+        # only keep most recent grade
+        data = data.sort(['termnum', 'sid'])
+        data = data.drop_duplicates(('sid','cid'), take_last=True)
+
+        # Write cleaned up data.
         with self.output().open('w') as out:
-            courses.to_csv(out, index=False)
+            data.to_csv(out, index=False)
 
 
 class TrainTestFilter(object):
     """Wrapper class to filter data to train/test sets using cohort/term."""
-
-    term_max = 14  # some number greater than max term id
+    term_max = MAX_NUM_COHORTS  # some number greater than max term id
 
     def __init__(self, filt):
         if ':' in filt:
@@ -276,17 +355,11 @@ class TrainTestFilter(object):
 class UsesTrainTestSplit(luigi.Task):
     """Base task for train/test split args and filters init."""
     train_filters = luigi.Parameter(
-        default='0-14',
+        default='0-1',
         description='Specify how to split the train set from the test set.')
     discard_nongrade = luigi.Parameter(
         default=True,
         description='drop W/S/NC grades from training data if True')
-    backfill_cold_students = luigi.IntParameter(
-        default=0,
-        description="number of courses to backfill for cold-start students")
-    backfill_cold_courses = luigi.IntParameter(
-        default=0,
-        description="number of courses to backfill for cold-start courses")
     remove_cold_start = luigi.IntParameter(
         default=1,
         description="remove all cold-start records from test set")
@@ -312,12 +385,9 @@ class UsesTrainTestSplit(luigi.Task):
         if not self.discard_nongrade:
             parts.append('ng')
 
-        # indicate whether cold-start backfilling was done for students/courses
+        # indicate whether cold-start records were removed for students/courses
         if self.remove_cold_start:
             parts.append('nocs')
-        else:
-            parts.append('scs%d' % self.backfill_cold_students)
-            parts.append('ccs%d' % self.backfill_cold_courses)
 
         # include optional class-specific suffix
         if self.suffix:
@@ -329,56 +399,17 @@ class UsesTrainTestSplit(luigi.Task):
 
 class DataSplitterBaseTask(UsesTrainTestSplit):
     """Functionality to split train/test data, no run method."""
+    data_source = PreprocessedData()
 
     def requires(self):
-        return PreprocessedCourseData()
+        return self.data_source
 
     def read_data(self):
         with self.input().open() as f:
-            data = pd.read_csv(f)
-
-        # only keep most recent grade
-        data = data.drop_duplicates(('sid','cid'), take_last=True)
-
-        # remove records for missing grades
-        data = data[~data['grdpts'].isnull()]
-        return data
-
-    def backfill(self, train, test, key, firstn):
-        """Used to prevent cold-start records.
-
-        :param DataFrame train: The training data.
-        :param DataFrame test: The test data.
-        :param str key: The key to backfill records for.
-        :param int firstn: How many records to backfill for cold-starts.
-
-        """
-        if not firstn:  # specified 0 records for backfill
-            return (train, test)
-
-        diff = np.setdiff1d(test[key].values, train[key].values)
-        diff_mask = test[key].isin(diff)
-        diff_records = test[diff_mask]
-
-        # figure out which records to transfer from test set to train set
-        # some keys will have less records than specified
-        gb = diff_records.groupby(key)
-        counts = gb[key].transform('count')
-        tokeep = counts - firstn
-        tokeep[tokeep < 0] = 0
-
-        # update train/test sets
-        removing = gb.head(firstn)
-        keeping = gb.tail(tokeep)
-        test = pd.concat((test[~diff_mask], keeping))
-        train = pd.concat((train, removing))
-        return (train, test)
+            return pd.read_csv(f)
 
     def split_data(self):
         data = self.read_data()
-
-        # sort data by term number, then by student id
-        data = data.sort(['termnum', 'sid'])
 
         # now do train/test split; drop duplicates in case filters overlap
         train = pd.concat([f.train(data) for f in self.filters]).drop_duplicates()
@@ -399,81 +430,60 @@ class DataSplitterBaseTask(UsesTrainTestSplit):
         if self.discard_nongrade:
             train = train[~train.GRADE.isin(toremove)]
 
-        # if instructed to avoid student/course cold-start,
-        # ensure all students/courses in the test set are also in the train set
-        if not self.remove_cold_start:
-            train, test = self.backfill(
-                train, test, 'sid', self.backfill_cold_students)
-            train, test = self.backfill(
-                train, test, 'cid', self.backfill_cold_courses)
-
         return (train, test)
-
-
-def write_triples(f, data, userid='sid', itemid='cid', rating='grdpts'):
-    """Write a data file of triples (sparse matrix).
-
-    :param str userid: Name of user id column (matrix rows).
-    :param str itemid: Name of item id column (matrix cols).
-    :param str rating: Name of rating column (matrix entries).
-    """
-    cols = [userid, itemid, rating]
-    data.to_csv(f, sep='\t', header=False, index=False, columns=cols)
-
-
-class UserCourseGradeTriples(DataSplitterBaseTask):
-    """Produce a User x Course matrix with quality points as entries."""
-
-    def run(self):
-        """Write the train/test data in triple format."""
-        for name, dataset in zip(['train', 'test'], self.split_data()):
-            with self.output()[name].open('w') as f:
-                write_triples(f, dataset)
-
-
-def write_libfm(f, data, userid='sid', itemid='cid', rating='grdpts',
-                timecol='', time_feat_num=0):
-    """Write a data file of triples (sparse matrix). This assumes the column ids
-    have already been offset by the max row id.
-
-    :param str userid: Name of user id column (matrix rows).
-    :param str itemid: Name of item id column (matrix cols).
-    :param str rating: Name of rating column (matrix entries).
-    :param int time_feat_num: Feature number for time attribute.
-    :param str timecol: Name of temporal column.
-    """
-    # TimeSVD
-    if time_feat_num:  # write time as categorical attribute
-        def extract_row(series):
-            return '%f %d:1 %d:1 %d:%d' % (
-                series[rating], series[userid], series[itemid],
-                time_feat_num, series[timecol])
-    # time-aware BPTF model
-    elif timecol:
-        def extract_row(series):
-            return '%f %d:1 %d:1 %d:1' % (
-                series[rating], series[userid], series[itemid], series[timecol])
-    # regularized SVD
-    else:
-        def extract_row(series):
-            return '%f %d:1 %d:1' % (
-                series[rating], series[userid], series[itemid])
-
-    lines = data.apply(extract_row, axis=1)
-    f.write('\n'.join(lines))
 
 
 class UserCourseGradeLibFM(DataSplitterBaseTask):
     """Output user-course grade matrix in libFM format."""
-    time = luigi.Parameter(
-        default='',
-        description='if empty; no time attributes, ' +
-                    'cat = categorical encoding (TimeSVD), ' +
-                    'bin = binary, one-hot encoding (BPTF)')
     task = luigi.Parameter(
         default='next',
         description='prediction task; next = next-term, all = all-terms')
     ext = 'libfm'
+
+    # Copy possible feature names from the source data task.
+    data_source = PreprocessedData()
+    cvals = data_source.cvals[:]
+    cvals.remove('cid')  # non-optional
+    cvals.remove('sid')  # non-optional
+    rvals = data_source.rvals[:]
+    rvals.remove('grdpts')  # non-optional
+
+    # TODO: get rid of featname in class namespace
+    possible_features = cvals + rvals
+    for featname in possible_features:
+        locals()[featname] = luigi.BoolParameter(default=False)
+
+    @property
+    def cvals_to_write(self):
+        return [cval for cval in self.cvals if getattr(self, cval)]
+
+    @property
+    def rvals_to_write(self):
+        return [rval for rval in self.rvals if getattr(self, rval)]
+
+    @property
+    def features(self):
+        return self.cvals_to_write + self.rvals_to_write
+
+    @property
+    def train(self):
+        try: return self._train
+        except: self._train, self._test = self.split_data()
+        return self._train
+
+    @train.setter
+    def train(self, train):
+        self._train = train
+
+    @property
+    def test(self):
+        try: return self._test
+        except: self._train, self._test = self.split_data()
+        return self._test
+
+    @test.setter
+    def test(self, test):
+        self._test = test
 
     def all_term_output(self):
         fname = self.output_base_fname()
@@ -503,78 +513,22 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
             return self.next_term_output()
 
     @property
-    def train(self):
-        try: return self._train
-        except: self._train, self._test = self.prep_data()
-        return self._train
-
-    @train.setter
-    def train(self, train):
-        self._train = train
-
-    @property
-    def test(self):
-        try: return self._test
-        except: self._train, self._test = self.prep_data()
-        return self._test
-
-    @test.setter
-    def test(self, test):
-        self._test = test
-
-    @property
     def term_range(self):
         """All terms for which prediction should be performed."""
-        # Due to the backfilling, we must rely on the train filters to get the
-        # last term in the training data.
         start = max([f.cohort_end for f in self.filters])
-        end = int(self.test[~self.test.cohort.isnull()].cohort.max())
+        end = MAX_NUM_COHORTS
         return range(start + 1, end + 1)
 
     @property
     def suffix(self):
-        return 'T%s' % self.time if self.time else ''
-
-    def prep_data(self):
-        """libFM has no notion of columns. It simply takes feature vectors with
-        labels. So we need to re-encode the columns by adding the max row index.
-        """
-        train, test = self.split_data()
-        max_row_idx = max(np.concatenate((test.sid.values, train.sid.values)))
-        train.cid += max_row_idx
-        test.cid += max_row_idx
-        return (train, test)
+        return abbrev_names(self.features)
 
     @property
     def write_libfm_data(self):
-        """If time is included, as a feature, we need to specify how it will be
-        written in the libFM format. The method being emulated changes based on
-        how we choose to encode it. We multiplex based on time in the sense that
-        we define a data writing function that writes the time data differently
-        depending on what the user has specified. This function is returned.
-        """
-        # one-hot encoding; BTPF
-        if self.time == 'bin':
-            max_col_idx = max(
-                np.concatenate((self.test.cid.values, self.train.cid.values)))
-
-            def write_libfm_data(f, data):
-                data.termnum += max_col_idx
-                write_libfm(f, data, timecol='termnum')
-
-        # categorical encoding; TimeSVD
-        elif self.time == 'cat':
-            max_col_idx = max(
-                np.concatenate((self.test.cid.values, self.train.cid.values)))
-
-            def write_libfm_data(f, data):
-                write_libfm(f, data, timecol='termnum',
-                            time_feat_num=max_col_idx + 1)
-
-        # do not include time variables in output
-        else:
-            write_libfm_data = write_libfm
-
+        def write_libfm_data(ftrain, ftest, train, test):
+            write_libfm(ftrain, ftest, train, test, target='grdpts',
+                        userid='sid', itemid='cid', cvals=self.cvals_to_write,
+                        rvals=self.rvals_to_write)
         return write_libfm_data
 
     def transfer_term(self, termnum):
@@ -599,9 +553,10 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         test = self.test.copy()
         test = self.handle_cold_start(test)
 
-        for name, dataset in zip(['train', 'test'], [self.train, test]):
-            with self.output()[name].open('w') as f:
-                self.write_libfm_data(f, dataset)
+        outputs = self.output()
+        trainf, testf = outputs['train'], outputs['test']
+        with trainf.open('w') as ftrain, testf.open('w') as ftest:
+            self.write_libfm_data(ftrain, ftest, self.train, test)
 
         # Write the term-to-id guide
         test = test.sort(('termnum'))
@@ -619,9 +574,11 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
             # remove cold start recordsif requested
             test = self.handle_cold_start(test)
 
-            for name, dataset in zip(['train', 'test'], [self.train, test]):
-                with outputs[termnum][name].open('w') as f:
-                    self.write_libfm_data(f, dataset)
+            term_outputs = outputs[termnum]
+            trainf, testf = term_outputs['train'], term_outputs['test']
+            with trainf.open('w') as ftrain, testf.open('w') as ftest:
+                self.write_libfm_data(ftrain, ftest, self.train, test)
+
             self.transfer_term(termnum)  # modify train/test sets in place
             # intentionally skip writing the last time this is run
 
