@@ -2,7 +2,8 @@ import os
 import numpy as np
 
 
-def write_libfm(f, df, target='grdpts', cvals=None, rvals=None):
+def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
+                itemid='cid', cvals=None, rvals=None):
     """Write feature vectors in libFM format from a DataFrame. libFM uses the
     same format as libSVM. It takes feature vectors of the form:
 
@@ -10,6 +11,11 @@ def write_libfm(f, df, target='grdpts', cvals=None, rvals=None):
 
     After writing the target value (which is written as a float), we write all
     the features for the vector.
+
+    Note that we take both the train and the test frame as required because the
+    max values in the indices must be calculated AT THE SAME TIME. Otherwise,
+    the data files will end up having different indices for the same entities,
+    which is garbage.
 
     There are two types of features we must be concerned with when writing these
     files: set-categoricals (cvals) and real-valued attributes (rvals).
@@ -26,20 +32,25 @@ def write_libfm(f, df, target='grdpts', cvals=None, rvals=None):
     gets a single id. They are written in the order passed in the `rvals`
     parameter.
     """
-    # Sanity checking; make sure we have some values to write.
-    if cvals is None:
-        if rvals is None:
-            raise ValueError("must pass either cvals or rvals")
-        else:
-            allvals = rvals
-    else:
-        if rvals is None:
-            allvals = cvals
-        else:
-            allvals = cvals + rvals
+    # Set up values, inserting user and item ids into the cvals.
+    cvals = cvals if cvals else []
+    cvals.insert(0, itemid)
+    cvals.insert(0, userid)
+
+    rvals = rvals if rvals else []
+    allvals = cvals + rvals
+
+    # Sanity check; make sure train/test columns are the same.
+    train_cols = np.sort(train.columns.values)
+    test_cols = np.sort(test.columns.values)
+    if not (train_cols == test_cols).all():
+        raise ValueError(
+            "train and test columns do not match:\nTRAIN: %s\nTEST: %s" % (
+                ','.join(map(str, train.columns)),
+                ','.join(map(str, test.columns))))
 
     # More sanity checking; make sure all columns passed are in DataFrame.
-    cols = df.columns
+    cols = train.columns  # we now know train/test have same columns
     if target not in cols:
         raise KeyError("target: %s not in DataFrame" % target)
     for colname in allvals:
@@ -49,10 +60,11 @@ def write_libfm(f, df, target='grdpts', cvals=None, rvals=None):
     # First, let's update the values for all cvals.
     max_idx = 0
     for cval in cvals:
-        df[cval] += max_idx
-        max_idx = np.nanmax(df[cval].values)
+        train[cval] += max_idx
+        test[cval] += max_idx
+        max_idx = max(
+            np.nanmax(train[cval].values), np.nanmax(test[cval].values)) + 1
 
-    max_idx += 1  # start value for rvals
     rval_indices = np.arange(len(rvals)) + max_idx
 
     # Now we need to actually extract the cvals.
@@ -68,9 +80,10 @@ def write_libfm(f, df, target='grdpts', cvals=None, rvals=None):
         return ' '.join(pieces)
 
     # TODO: consider adding chunksize param to reduce memory overhead.
-    lines = df.apply(extract_row, axis=1)
-    f.write('\n'.join(lines))
-
+    lines = train.apply(extract_row, axis=1)
+    ftrain.write('\n'.join(lines))
+    lines = test.apply(extract_row, axis=1)
+    ftest.write('\n'.join(lines))
 
 
 def write_triples(f, data, userid='sid', itemid='cid', rating='grdpts'):
