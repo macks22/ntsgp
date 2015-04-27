@@ -33,9 +33,9 @@ grade2pts = {
     'D':    1.00,
     'F':    0.00,
     'IN':   0.00,    # Incomplete
-    'S':    3.00,    # Satisfactory (passing; C and up, no effect on GPA)
-    'NC':   1.00,    # No Credit (often C- and below)
-    'W':    1.00,    # Withdrawal (does not affect grade)
+    'S':    np.nan,    # Satisfactory (passing; C and up, no effect on GPA)
+    'NC':   np.nan,    # No Credit (often C- and below)
+    'W':    np.nan,    # Withdrawal (does not affect grade)
     'NR':   np.nan,  # Not Reported (possibly honor code violation)
     'AU':   np.nan,  # Audit
     'REG':  np.nan,  # ?
@@ -48,10 +48,15 @@ grade2pts = {
 
 # Fix up the grades where possible.
 def fill_grdpts(series):
-    """Fill in missing values for grade quality points."""
+    """Fill in missing values for grade quality points. This also replaces any
+    existing grdpts values with the propper mapping from the letter grade. We
+    assume the letter grades are more reliable when they are present.
+    """
     # TODO: can fill missing lab grades with lecture grades if we can match them
-    return (grade2pts[series['GRADE']] if series['GRADE'] != np.nan
-            else series['grdpts'])
+    if series['GRADE'] != np.nan:
+        return grade2pts[series['GRADE']]
+    else:
+        return series['grdpts']
 
 
 def map_columns(df, colnames, newname=None, remove=True):
@@ -130,40 +135,49 @@ def read_idmap(colnames):
         return pd.read_csv(f, index_col=0)
 
 
+def extract_clevel(cnum):
+    """Extract the course level from the course number."""
+    if cnum == np.nan:
+        return np.nan
+    cnum = str(cnum).strip()
+    if not cnum:
+        return np.nan
+    digits = filter(lambda c: c.isdigit(), cnum)
+    if not digits:
+        return np.nan
+    return digits[0]
+
+
 def preprocess(outname='preprocessed-data.csv'):
-    courses = pd.read_csv('data/nsf_courses.csv')
-    students = pd.read_csv('data/nsf_student.csv')
-    admiss = pd.read_csv('data/nsf_admissions.csv')
     demog = pd.read_csv('data/nsf_demographics.csv')
 
-    # Filter out unneeded columns from the tables.
+    # Specify which columns to keep and read in data.
     courses_cols = ['id', 'TERMBNR', 'DISC', 'CNUM', 'GRADE', 'HRS',
                     'grdpts', 'INSTR_LNAME', 'INSTR_FNAME', 'class',
-                    'instr_rank', 'instr_tenure']
-    courses = courses[courses_cols]
+                    'instr_rank', 'instr_tenure', 'TITLE']
+    courses = pd.read_csv('data/nsf_courses.csv', usecols=courses_cols)
 
     students_cols = ['id', 'cohort', 'TERMBNR', 'PMAJR', 'termgpa',
                      'term_earn_hrs', 'cumgpa']
-    students = students[students_cols]
+    students = pd.read_csv('data/nsf_student.csv', usecols=students_cols)
 
     admiss_cols = ['id', 'cohort', 'Permanent_Address_ZIP', 'HSGPA',
                    'SAT_Total_1600', 'HS_CEEB_Code']
-    admiss = admiss[admiss_cols]
+    admiss = pd.read_csv('data/nsf_admissions.csv', usecols=admiss_cols)
 
     # Merge student and demographic data.
-    out = students.merge(demog, how='outer', on=('id',))
+    out = students.merge(demog, how='left', on='id')
 
     # Map several of the ids in this table.
-    out = map_columns(out, 'ENTRY_AGE', 'age')
     out = map_columns(out, 'race', 'race')
     out = map_columns(out, 'SEX', 'sex')
 
-    # # Merge students and courses data.
-    out = out.merge(courses, how='outer', on=('id', 'TERMBNR'))
+    # # Merge courses and student data.
+    out = courses.merge(out, how='left', on=('id', 'TERMBNR'))
 
     # Map several of the ids in the resulting table.
     out = map_columns(out, 'TERMBNR', 'termnum')
-    out = map_columns(out, ['CNUM', 'DISC', 'HRS'], 'cid', remove=False)
+    out = map_columns(out, ['DISC', 'CNUM', 'HRS'], 'cid', remove=False)
     out = map_columns(out, 'DISC', 'cdisc')
     out = map_columns(out, ['INSTR_LNAME', 'INSTR_FNAME'], 'iid')
     out = map_columns(out, 'class', 'iclass')
@@ -172,8 +186,7 @@ def preprocess(outname='preprocessed-data.csv'):
     out = map_columns(out, 'PMAJR', 'major')
 
     # Get course level from CNUM.
-    out['clevel'] = out['CNUM'].apply(
-        lambda cnum: str(cnum)[0] if cnum != np.nan else np.nan)
+    out['clevel'] = out['CNUM'].apply(extract_clevel)
     del out['CNUM']
 
     # Fill in missing values for quality points.
@@ -181,123 +194,41 @@ def preprocess(outname='preprocessed-data.csv'):
     del out['GRADE']
 
     # Next, merge with the admissions data.
-    out = out.merge(admiss, how='outer', on=('id', 'cohort'))
+    out = out.merge(admiss, how='left', on=('id', 'cohort'))
 
     # Map columns.
-    out = map_columns(out, 'HS_CEEB_Code', 'hs')
-    out = map_columns(out, 'cohort', 'cohort')
-    out = map_columns(out, 'id', 'sid')
     out = map_columns(out, 'Permanent_Address_ZIP', 'zip')
+    out = map_columns(out, 'HS_CEEB_Code', 'hs')
+    out = map_columns(out, 'id', 'sid')
+
+    # Map cohort using TERMBNR mapping.
+    idmap = read_idmap('TERMBNR')
+    newname = 'new_cohort'
+    idmap[newname] = idmap.index  # tmp column; avoid conflict on cohort
+    out = out.merge(idmap, how='left', left_on='cohort', right_on='TERMBNR')
+    out['cohort'] = out[newname]  # replace old with tmp
+    del out[newname]    # remove tmp column
+    del out['TERMBNR']  # remove extra TERMBNR column acquired during merge
 
     # Rename some columns.
     out.rename(columns={
         'HSGPA': 'hsgpa',
         'SAT_Total_1600': 'sat',
-        'HRS': 'chrs'
+        'HRS': 'chrs',
+        'ENTRY_AGE': 'age'
     }, inplace=True)
-
-    # Drop definite duplicates.
-    out = out.sort(['sid', 'termnum'])
-    out = out.drop_duplicates(['sid', 'cid', 'iid', 'grdpts'], take_last=True)
 
     # Remove any records without grdpts
     out = out[~out['grdpts'].isnull()]
+
+    # Drop duplicate (student, course) pairs, keeping last attempt.
+    out = out.sort(['termnum', 'sid'])
+    out = out.drop_duplicates(['sid', 'cid'], take_last=True)
 
     # Write out the data to a csv file.
     out.to_csv(outname, index=False)
 
 
-
 # Do everything in main to make IPython inspection simple.
 if __name__ == "__main__":
-    courses = pd.read_csv('data/nsf_courses.csv')
-    students = pd.read_csv('data/nsf_student.csv')
-    admiss = pd.read_csv('data/nsf_admissions.csv')
-    demog = pd.read_csv('data/nsf_demographics.csv')
-
-    # Filter out unneeded columns from the tables.
-    courses_cols = ['id', 'TERMBNR', 'DISC', 'CNUM', 'GRADE', 'HRS',
-                    'grdpts', 'INSTR_LNAME', 'INSTR_FNAME', 'class',
-                    'instr_rank', 'instr_tenure']
-    courses = courses[courses_cols]
-
-    students_cols = ['id', 'cohort', 'TERMBNR', 'PMAJR', 'termgpa',
-                     'term_earn_hrs', 'cumgpa']
-    students = students[students_cols]
-
-    admiss_cols = ['id', 'cohort', 'Permanent_Address_ZIP', 'HSGPA',
-                   'SAT_Total_1600', 'HS_CEEB_Code']
-    admiss = admiss[admiss_cols]
-
-    # Merge student and demographic data.
-    out = students.merge(demog, how='outer', on=('id',))
-
-    # Map several of the ids in this table.
-    out = map_columns(out, 'ENTRY_AGE', 'age')
-    out = map_columns(out, 'race', 'race')
-    out = map_columns(out, 'SEX', 'sex')
-
-    # # Merge students and courses data.
-    out = out.merge(courses, how='outer', on=('id', 'TERMBNR'))
-
-    # Map several of the ids in the resulting table.
-    out = map_columns(out, ['CNUM', 'DISC', 'HRS'], 'cid', remove=False)
-    out = map_columns(out, 'DISC', 'cdisc')
-    out = map_columns(out, ['INSTR_LNAME', 'INSTR_FNAME'], 'iid')
-    out = map_columns(out, 'class', 'iclass')
-    out = map_columns(out, 'instr_rank', 'irank')
-    out = map_columns(out, 'instr_tenure', 'itenure')
-    out = map_columns(out, 'PMAJR', 'major')
-
-    # Get course level from CNUM.
-    out['clevel'] = out['CNUM'].apply(
-        lambda cnum: str(cnum)[0] if cnum != np.nan else np.nan)
-    del out['CNUM']
-
-    # Fill in missing values for quality points.
-    out['grdpts'] = out.apply(fill_grdpts, axis=1)
-    del out['GRADE']
-
-    # Next, merge with the admissions data.
-    out = out.merge(admiss, how='outer', on=('id', 'cohort'))
-
-    # Map columns.
-    out = map_columns(out, 'HS_CEEB_Code', 'hs')
-    out = map_columns(out, 'id', 'sid')
-    out = map_columns(out, 'Permanent_Address_ZIP', 'zip')
-
-    # Replace cohort using TERMBNR mapping
-    out = map_columns(out, 'TERMBNR', 'termnum')
-    idmap = read_idmap('TERMBNR')
-    newname = 'new_cohort'
-    idmap[newname] = idmap.index
-    out = out.merge(idmap, how='left', left_on='cohort', right_on='TERMBNR')
-    out['cohort'] = out[newname]
-    del out[newname]
-    del out['TERMBNR']
-
-    # Rename some columns.
-    out.rename(columns={
-        'HSGPA': 'hsgpa',
-        'SAT_Total_1600': 'sat',
-        'HRS': 'chrs'
-    }, inplace=True)
-
-    # Drop definite duplicates.
-    out = out.sort(['sid', 'termnum'])
-    out = out.drop_duplicates(['sid', 'cid', 'iid', 'grdpts'], take_last=True)
-
-    # Remove any records without grdpts
-    out = out[~out['grdpts'].isnull()]
-
-    # What attributes do we want to write?
-    finstructor = ['iid', 'iclass', 'irank', 'itenure']
-    fcourse = ['cid', 'clevel', 'cdisc', 'termnum']
-    fstudent = ['sid', 'cohort', 'race', 'sex', 'zip', 'major', 'hs']
-    cvals = finstructor + fcourse + fstudent
-    rvals = ['age', 'hsgpa', 'sat', 'chrs']
-
-    # Write out the data to a csv file.
-    out.to_csv('preprocessed-ers-data.csv', index=False)
-    # with open('preprocessed-ers-data.libfm', 'w') as f:
-    #     write_libfm(f, out, target='grdpts', cvals=cvals, rvals=rvals)
+    preprocess('data/preprocessed-data.csv')
