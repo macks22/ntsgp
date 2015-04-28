@@ -1,5 +1,6 @@
 import os
 import logging
+import itertools as it
 from collections import OrderedDict
 
 import luigi
@@ -7,7 +8,9 @@ import numpy as np
 import pandas as pd
 
 import test_params
-from recpipe import UserCourseGradeLibFM, UsesTrainTestSplit
+from util import *
+import summary
+from recpipe import UserCourseGradeLibFM, UsesFeatures
 
 
 class UnexpectedNaN(Exception):
@@ -15,13 +18,8 @@ class UnexpectedNaN(Exception):
     pass
 
 
-class UsesLibFM(UsesTrainTestSplit):
+class UsesLibFM(UsesFeatures):
     """Base class for any class that uses libFM to produce results."""
-    time = luigi.Parameter(
-        default='',
-        description='if empty; no time attributes, ' +
-                    'cat = categorical encoding (TimeSVD), ' +
-                    'bin = binary, one-hot encoding (BPTF)')
     task = luigi.Parameter(
         default='next',
         description='prediction task; next = next-term, all = all-terms')
@@ -33,11 +31,12 @@ class UsesLibFM(UsesTrainTestSplit):
         description='initial std of Gaussian spread; higher can be faster')
     use_bias = luigi.BoolParameter(
         default=False,
-        description='use global and per-feature bias terms if True')
+        description='use per-feature bias terms if True')
     dim = luigi.IntParameter(
         default=7,
         description='dimensionality to use for matrix factorization')
 
+    suffix = ''
     prefix = ''
     subtask_class = UserCourseGradeLibFM
 
@@ -45,9 +44,9 @@ class UsesLibFM(UsesTrainTestSplit):
     def libfm_arg_indicators(self):
         parts = []
 
-        # time information part
-        if self.time:
-            parts.append('T%s' % self.time)
+        # Add feature names (abbreviated) to path name.
+        if self.features:
+            parts.append(abbrev_names(self.features))
 
         # number of iterations part
         parts.append('i%d' % self.iterations)
@@ -271,94 +270,66 @@ class RunLibFM(UsesLibFM):
             f.write('\t'.join(running_vals))
 
 
-class SVD(RunLibFM):
-    """Run libFM to emulate SVD."""
-    use_bias = False
-    time = ''
+class RunFeatureCombinations(RunLibFM):
+    """Run with various feature combinations; allow |F| choose nfeats."""
+    nfeats = luigi.IntParameter(
+        default=1, description='how many params to use in combinations')
 
-class BiasedSVD(SVD):
-    """Run libFM to emulate biased SVD."""
-    use_bias = True
-
-class TimeSVD(SVD):
-    """Run libFM to emulate TimeSVD."""
-    time = 'cat'
-
-class BiasedTimeSVD(TimeSVD):
-    """Run libFM to emulate biased TimeSVD."""
-    use_bias = True
-
-class BPTF(RunLibFM):
-    """Run libFM to emulate Bayesian Probabilistic Tensor Factorization."""
-    use_bias = False
-    time = 'bin'
-
-class BiasedBPTF(BPTF):
-    """Run libFM to emulate biased BPTF."""
-    use_bias = True
-
-
-class RunAllOnSplit(RunLibFM):
-    """Run all available methods via libFM for a particular train/test split."""
-    train_filters = luigi.Parameter(  # restate to make non-optional
-        description='Specify how to split the train set from the test set.')
-    time = ''     # disable parameter
-    use_bias = '' # disable parameter
-    subtask_class = RunLibFM
+    @property
+    def basekwargs(self):
+        kwargs = self.param_kwargs.copy()
+        del kwargs['nfeats']  # remove params unique to this class
+        # Disable all features to start.
+        for featname in self.possible_features:
+            kwargs[featname] = False
+        return kwargs
 
     def requires(self):
-        return [
-            SVD(**self.param_kwargs),
-            BiasedSVD(**self.param_kwargs),
-            TimeSVD(**self.param_kwargs),
-            BiasedTimeSVD(**self.param_kwargs),
-            BPTF(**self.param_kwargs),
-            BiasedBPTF(**self.param_kwargs)
-        ]
+        tasks = []  # store tasks to run; will be returned
+        kwargs = self.basekwargs
+
+        # now get all possible combinations
+        for attrs in it.combinations(self.possible_features, self.nfeats):
+            # enable parameters from this combination
+            params = kwargs.copy()
+            for attr in attrs:
+                params[attr] = True
+            tasks.append(RunLibFM(**params))
+
+        return tasks
 
     def output(self):
         """ Each method returns a dictionary with the 'error' key containing a
         listing of term-by-term and overall RMSE, and the 'predict' key
         containing files with all grade predictions. We only want to pass on
-        the error files, since the eventual goal is comparison between methods.
+        the error files, since the eventual goal is feature info comparison.
         """
         error_files = [in_dict['error'] for in_dict in self.input()]
         return [luigi.LocalTarget(f.path) for f in error_files]
 
-    def extract_method_name(self, outfile):
-        """We can pull these from the first prediction file. The method name is
-        present before the last two extensions. For example: SVD.t9.pred.
-        """
-        subext = os.path.splitext(outfile)[0]
-        base = os.path.splitext(subext)[0]
-        return os.path.splitext(base)[1].strip('.')
+    def extract_feat_abbrev(self, path):
+        parts = path.split('-')
+        return parts[1] if parts[1] != 'nocs' else parts[2]
 
-    @property
-    def method_names(self):
-        return [self.extract_method_name(in_dict['predict'].values()[0].path)
-                for in_dict in self.input()]
+    def feat_combos(self):
+        return [self.extract_feat_abbrev(f.path) for f in self.output()]
 
-    run = luigi.Task.run  # reset to default
+    run = luigi.Task.run  # set to default
 
 
-class CompareMethods(RunAllOnSplit):
-    """Aggregate results from all available methods on a particular split."""
-
+class CompareFeatures(RunFeatureCombinations):
+    """Compare results from including various features."""
     base = 'outcomes'
     ext = 'tsv'
-    subtask_class = RunAllOnSplit
+    subtask_class = RunFeatureCombinations
 
     def output(self):
         base_fname = self.base_outfile_name
-        fname = base_fname % 'compare'
+        fname = base_fname % ('compare-nf%d' % self.nfeats)
         return luigi.LocalTarget(fname)
 
     def requires(self):
         return self.subtask
-
-    @property
-    def method_names(self):
-        return [self.extract_method_name(f.path) for f in self.input()]
 
     def read_results(self, f):
         """Each file has a header, with the term numbers, a row of RMSE scores
@@ -366,10 +337,13 @@ class CompareMethods(RunAllOnSplit):
         """
         return [l.split('\t') for l in f.read().split('\n')]
 
+    def feat_combos(self):
+        return [self.extract_feat_abbrev(f.path) for f in self.input()]
+
     def run(self):
         results = {}
         for f in self.input():
-            name = self.extract_method_name(f.path)
+            name = self.extract_feat_abbrev(f.path)
             with f.open() as f:
                 header, counts, perterm, running = self.read_results(f)
                 results[name] = [perterm, running]
@@ -390,10 +364,10 @@ class CompareMethods(RunAllOnSplit):
                 f.write('%s\n' % '\t'.join([name, 'running'] + running))
 
 
-class ResultsMarkdownTable(CompareMethods):
+class ResultsMarkdownTable(CompareFeatures):
     """Produce markdown table of results comparison for a data split."""
 
-    subtask_class = CompareMethods
+    subtask_class = CompareFeatures
 
     def output(self):
         outname = self.input().path
@@ -440,6 +414,23 @@ class ResultsMarkdownTable(CompareMethods):
             f.write('\n'.join([''.join(row) for row in table2]))
 
 
+class ResultsSummary(ResultsMarkdownTable):
+    subtask_class = ResultsMarkdownTable
+
+    def output(self):
+        outname = self.input().path
+        base = os.path.splitext(outname)[0]
+        return luigi.LocalTarget('%s-summ.md' % base)
+
+    def run(self):
+        with self.input().open() as f:
+            report = summary.summary(f)
+
+        with self.output().open('w') as f:
+            f.write(report)
+
+
+# TODO: update for feature comparison.
 class RunAll(luigi.Task):
     """Run all available methods on 0-4 and 0-7 train/test splits."""
     iterations = luigi.IntParameter(
@@ -451,12 +442,6 @@ class RunAll(luigi.Task):
     discard_nongrade = luigi.Parameter(
         default=True,
         description='drop W/S/NC grades from training data if True')
-    backfill_cold_students = luigi.IntParameter(
-        default=0,
-        description="number of courses to backfill for cold-start students")
-    backfill_cold_courses = luigi.IntParameter(
-        default=0,
-        description="number of courses to backfill for cold-start courses")
     remove_cold_start = luigi.IntParameter(
         default=1,
         description="remove all cold-start records from test set")
@@ -486,7 +471,7 @@ class RunAll(luigi.Task):
     def num_iterations(self):
         """The total number of iterations libFM is run over all methods."""
         task = RunAllOnSplit(train_filters=self.splits[0], **self.param_kwargs)
-        return task.iterations * self.complexity
+        return task.iterations * self.num_method_runs
 
     # TODO: extend this to actually perform comparison between results
     def requires(self):

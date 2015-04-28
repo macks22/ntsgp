@@ -6,14 +6,24 @@ import sys
 import numpy as np
 
 
-def summary(fname, concise=False):
+def get_fhandle(filepath_or_buffer):
+    if hasattr(filepath_or_buffer, 'read'):
+        return filepath_or_buffer
+    else:
+        try:
+            return open(filepath_or_buffer)
+        except:
+            return filepath_or_buffer.open()
+
+
+def summary(fpath_or_buff, concise=False):
     """The file being read has a table of the per-term error, and a second table
     with running mean of error. We want a table that just has the per-term error
     and the cumulative error. We can also discard the `rmse` column, which just
     specifies the difference between the tables.
     """
-    with open(fname) as f:
-        content = f.read()
+    f = get_fhandle(fpath_or_buff)
+    content = f.read()
 
     t1, t2 = content.split('\n\n')
     rows = [l.split() for l in t2.split('\n') if l]
@@ -68,4 +78,5 @@ def summary(fname, concise=False):
 
 if __name__ == "__main__":
     fname = sys.argv[1]
-    print summary(fname)
+    with open(fname) as f:
+        print summary(f)
