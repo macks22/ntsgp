@@ -397,9 +397,40 @@ class UsesTrainTestSplit(luigi.Task):
         return '{}.%s.{}'.format(fbase, self.ext)
 
 
-class DataSplitterBaseTask(UsesTrainTestSplit):
-    """Functionality to split train/test data, no run method."""
+class UsesFeatures(UsesTrainTestSplit):
+    """Allow selection of features via luigi cmdline params."""
+    # Copy possible feature names from the source data task.
     data_source = PreprocessedData()
+    cvals = data_source.cvals[:]
+    cvals.remove('cid')  # non-optional
+    cvals.remove('sid')  # non-optional
+    rvals = data_source.rvals[:]
+    rvals.remove('grdpts')  # non-optional
+
+    # TODO: get rid of featname in class namespace
+    possible_features = cvals + rvals
+    for featname in possible_features:
+        locals()[featname] = luigi.BoolParameter(default=False)
+
+    @property
+    def cvals_to_write(self):
+        return [cval for cval in self.cvals if getattr(self, cval)]
+
+    @property
+    def rvals_to_write(self):
+        return [rval for rval in self.rvals if getattr(self, rval)]
+
+    @property
+    def features(self):
+        return self.cvals_to_write + self.rvals_to_write
+
+    @property
+    def suffix(self):
+        return abbrev_names(self.features)
+
+
+class DataSplitterBaseTask(UsesFeatures):
+    """Functionality to split train/test data, no run method."""
 
     def requires(self):
         return self.data_source
@@ -439,31 +470,6 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         default='next',
         description='prediction task; next = next-term, all = all-terms')
     ext = 'libfm'
-
-    # Copy possible feature names from the source data task.
-    data_source = PreprocessedData()
-    cvals = data_source.cvals[:]
-    cvals.remove('cid')  # non-optional
-    cvals.remove('sid')  # non-optional
-    rvals = data_source.rvals[:]
-    rvals.remove('grdpts')  # non-optional
-
-    # TODO: get rid of featname in class namespace
-    possible_features = cvals + rvals
-    for featname in possible_features:
-        locals()[featname] = luigi.BoolParameter(default=False)
-
-    @property
-    def cvals_to_write(self):
-        return [cval for cval in self.cvals if getattr(self, cval)]
-
-    @property
-    def rvals_to_write(self):
-        return [rval for rval in self.rvals if getattr(self, rval)]
-
-    @property
-    def features(self):
-        return self.cvals_to_write + self.rvals_to_write
 
     @property
     def train(self):
@@ -520,10 +526,6 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         return range(start + 1, end + 1)
 
     @property
-    def suffix(self):
-        return abbrev_names(self.features)
-
-    @property
     def write_libfm_data(self):
         def write_libfm_data(ftrain, ftest, train, test):
             write_libfm(ftrain, ftest, train, test, target='grdpts',
@@ -543,9 +545,8 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
             for key in ['sid', 'cid']:
                 diff = np.setdiff1d(test[key].values, self.train[key].values)
                 diff_mask = test[key].isin(diff)
-                return test[~diff_mask]
-        else:
-            return test
+                test = test[~diff_mask]
+        return test
 
     def produce_all_term_data(self):
         """Produce train/test data for all-term prediction task."""
