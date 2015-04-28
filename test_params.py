@@ -34,7 +34,7 @@ def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
         '-train', train,
         '-test', test,
         '-iter', str(iter),
-        '-dim', '1,%d,%d' % (bias, dim),
+        '-dim', '%d,%d,%d' % (bias, bias, dim),
         '-init_stdev', str(std)
     ]
     if outfile:
