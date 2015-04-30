@@ -223,7 +223,14 @@ class PreprocessedData(BasicLuigiTask):
         'major': 1, 'srace': 1, 'sex': 1
     }
     cvals = attributes.keys()
-    rvals = ['grdpts', 'age', 'hsgpa', 'sat', 'chrs', 'clevel']
+
+    # Combine rvals from data and those produced from feature engineering.
+    rvals = ['grdpts', 'age', 'hsgpa', 'sat', 'chrs', 'clevel'] + ['lterm_gpa',
+            'lterm_cum_gpa', 'total_chrs', 'num_enrolled', 'lterm_cgpa',
+            'lterm_cum_cgpa']
+
+    # Finally, create dict of all data source tasks and attribute mapping tasks
+    # to be required by this task.
     data_tasks = {src_name: task() for src_name, task in DATA_TASKS.items()}
     idmap_classes = [IDMAP_TASKS[attr] for attr in cvals]
     idmap_tasks = {klass.__name__: klass() for klass in idmap_classes}
@@ -260,8 +267,7 @@ class PreprocessedData(BasicLuigiTask):
         courses['clevel'] = courses['CNUM'].apply(extract_clevel)
 
         # add student data first.
-        students_cols = ['id', 'cohort', 'TERMBNR', 'PMAJR', 'termgpa',
-                         'term_earn_hrs', 'cumgpa']
+        students_cols = ['id', 'cohort', 'TERMBNR', 'PMAJR', 'term_earn_hrs']
         with self.input()['students'].open() as f:
             students = pd.read_csv(f, usecols=students_cols)
 
@@ -279,18 +285,19 @@ class PreprocessedData(BasicLuigiTask):
         with self.input()['admissions'].open() as f:
             admiss = pd.read_csv(f, usecols=admiss_cols)
 
+        # Merge with admissions data on (id, cohort).
+        data = data.merge(admiss, how='left', on=('id', 'cohort'))
+
+        # Map set-categorical ids to contiguous numerical indices.
+        for idname, remove_flag in self.attributes.items():
+            data = map_ids(data, idname, remove=remove_flag)
+
+        # Map cohort column values to same numerical index used for TERMBNR.
         with self.input()['CoursesTermnumMap'].open() as f:
             idmap = pd.read_csv(f, index_col=0)
 
-        # Map cohort column values to numerical index.
-        admiss = use_idmap(
-            admiss, idmap, 'cohort', oldcols=['TERMBNR'], remove=True)
-        data = data.merge(admiss, how='left', on=('id', 'cohort'))
-
-        # Replace course, student, instructor and term identifiers with
-        # contiguous id mappings
-        for idname, remove_flag in self.attributes.items():
-            data = map_ids(data, idname, remove=remove_flag)
+        data = use_idmap(
+            data, idmap, 'cohort', oldcols=['TERMBNR'], remove=True)
 
         # remove unneeded columns not deleted during mapping procedure
         unneeded = ['DISC', 'CNUM']
@@ -311,9 +318,111 @@ class PreprocessedData(BasicLuigiTask):
         data = data.sort(['termnum', 'sid'])
         data = data.drop_duplicates(('sid','cid'), take_last=True)
 
+        # Feature engineering.
+        data = self.engineer_features(data)
+
         # Write cleaned up data.
         with self.output().open('w') as out:
             data.to_csv(out, index=False)
+
+        return data
+
+    def engineer_features(self, data):
+        """Engineer new features from the existing data."""
+
+        # Compute quality points for each record.
+        data['qpts'] = data['chrs'] * data['grdpts']
+
+        # Compute total quality points per term.
+        data['term_qpts'] = data.groupby(['sid', 'termnum'])\
+                                 [['qpts']].transform('sum')
+        tmp = data[['sid', 'termnum', 'term_qpts']]\
+                .drop_duplicates(['sid', 'termnum'])\
+                .sort(['sid', 'termnum'])
+        tmp['total_qpts'] = tmp.groupby('sid')[['term_qpts']]\
+                               .transform('cumsum')
+        del tmp['term_qpts']
+        data = data.merge(tmp, how='left', on=['sid', 'termnum'])
+
+        # Next compute total hours earned each term and across terms.
+        data['term_chrs'] = data.groupby(['sid', 'termnum'])\
+                                 [['chrs']].transform('sum')
+        tmp = data[['sid', 'termnum', 'term_chrs']]\
+                .drop_duplicates(['sid', 'termnum'])\
+                .sort(['sid', 'termnum'])
+        tmp['total_chrs'] = tmp.groupby('sid')[['term_chrs']]\
+                               .transform('cumsum')
+        del tmp['term_chrs']
+        data = data.merge(tmp, how='left', on=['sid', 'termnum'])
+
+        # Now we can compute term gpa...
+        data['term_gpa'] = data['term_qpts'] / data['term_chrs']
+
+        # and the running gpa for each student.
+        data['cum_gpa'] = data['total_qpts'] / data['total_chrs']
+
+        # Finally, shift several attributes forward so the feature vectors
+        # include information from the last term to use for predicting values in
+        # the current term. Leave out quality points because gpa is a summary.
+        merge_on = ['sid', 'termnum']
+        tmp = data.drop_duplicates(merge_on).sort(merge_on)
+        cols = ['term_gpa', 'term_chrs', 'cum_gpa', 'total_chrs']
+        shifted = tmp.groupby('sid')[cols].shift(1)
+        keep = ['lterm_gpa', 'lterm_chrs', 'lterm_cum_gpa', 'lterm_total_chrs']
+        shifted.columns = keep
+        keep += merge_on
+        tmp = tmp.merge(shifted, how='left', right_index=True, left_index=True)
+        tmp = tmp[keep]
+        data = data.merge(tmp, how='left', on=merge_on)
+
+        # Now we're done with student GPA features. Let's move on to course GPA,
+        # AKA course difficulty as evidenced by student grdpts over time.
+
+        # First, we add total # students enrolled at each term and across them.
+        data['num_enrolled'] = data.groupby(['cid', 'termnum'])['cid']\
+                                   .transform('count')
+
+        # Add total number of students enrolled so far at each term.
+        tmp = data[['cid', 'termnum', 'num_enrolled']]\
+                .drop_duplicates(['cid', 'termnum'])\
+                .sort(['cid', 'termnum'])
+        tmp['total_enrolled'] = tmp.groupby('cid')[['num_enrolled']]\
+                                   .transform('cumsum')
+        del tmp['num_enrolled']
+        data = data.merge(tmp, how='left', on=['cid', 'termnum'])
+
+        # Now sum grdpts together for each term.
+        data['term_grdpts_sum'] = data.groupby(['cid', 'termnum'])\
+                                   [['grdpts']].transform('sum')
+        tmp = data[['cid', 'termnum', 'term_grdpts_sum']]\
+                .drop_duplicates(['cid', 'termnum'])\
+                .sort(['cid', 'termnum'])
+        tmp['total_grdpts_sum'] = tmp.groupby('cid')[['term_grdpts_sum']]\
+                                    .transform('cumsum')
+        del tmp['term_grdpts_sum']
+        data = data.merge(tmp, how='left', on=['cid', 'termnum'])
+
+        # Now we can compute course avg. gpa at each term...
+        data['term_cgpa'] = data['term_grdpts_sum'] / data['num_enrolled']
+
+        # and the running avg course gpa.
+        data['cum_cgpa'] = data['total_grdpts_sum'] / data['total_enrolled']
+
+        # Finally, shift some feature values forward one to make the previous
+        # term's values accessible for prediction in the current term.
+        merge_on = ['cid', 'termnum']
+        tmp = data.drop_duplicates(merge_on).sort(merge_on)
+        cols = ['term_cgpa', 'cum_cgpa', 'num_enrolled', 'total_enrolled']
+        shifted = tmp.groupby('cid')[cols].shift(1)
+        keep = ['lterm_cgpa', 'lterm_cum_cgpa', 'lterm_num_enrolled',
+                'lterm_total_enrolled']
+        shifted.columns = keep
+        keep += merge_on
+        tmp = tmp.merge(shifted, how='left', right_index=True, left_index=True)
+        tmp = tmp[keep]
+        data = data.merge(tmp, how='left', on=merge_on)
+
+        return data
 
 
 class TrainTestFilter(object):
@@ -399,6 +508,10 @@ class UsesTrainTestSplit(luigi.Task):
 
 class UsesFeatures(UsesTrainTestSplit):
     """Allow selection of features via luigi cmdline params."""
+    prev_cgrades = luigi.BoolParameter(
+        default=False,
+        description='use past course grades as features')
+
     # Copy possible feature names from the source data task.
     data_source = PreprocessedData()
     cvals = data_source.cvals[:]
@@ -414,11 +527,11 @@ class UsesFeatures(UsesTrainTestSplit):
 
     @property
     def cvals_to_write(self):
-        return [cval for cval in self.cvals if getattr(self, cval)]
+        return [cval for cval in self.cvals if getattr(self, cval, '')]
 
     @property
     def rvals_to_write(self):
-        return [rval for rval in self.rvals if getattr(self, rval)]
+        return [rval for rval in self.rvals if getattr(self, rval, '')]
 
     @property
     def features(self):
@@ -426,7 +539,10 @@ class UsesFeatures(UsesTrainTestSplit):
 
     @property
     def suffix(self):
-        return abbrev_names(self.features)
+        parts = [abbrev_names(self.features)]
+        if self.prev_cgrades:
+            parts.append('Pcgr')
+        return '-'.join(parts)
 
 
 class DataSplitterBaseTask(UsesFeatures):
@@ -530,7 +646,8 @@ class UserCourseGradeLibFM(DataSplitterBaseTask):
         def write_libfm_data(ftrain, ftest, train, test):
             write_libfm(ftrain, ftest, train, test, target='grdpts',
                         userid='sid', itemid='cid', cvals=self.cvals_to_write,
-                        rvals=self.rvals_to_write)
+                        rvals=self.rvals_to_write,
+                        prev_cgrades=self.prev_cgrades)
         return write_libfm_data
 
     def transfer_term(self, termnum):

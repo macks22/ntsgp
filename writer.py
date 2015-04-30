@@ -1,9 +1,32 @@
 import os
 import numpy as np
+import pandas as pd
+
+
+def make_prev_crecord_fmter(data):
+    """Create a function closure with a cache. Return the internal function
+    which formats the previous course grades in libFM format.
+    """
+    cache = {}
+    data['pcgrade'] = data[['pcid', 'grdpts']].apply(
+        lambda s: '%d:%f' % tuple(s.values), axis=1)
+    def prior_cgrades(sid, termnum):
+        try:
+            return cache[(sid, termnum)]
+        except KeyError:
+            df = data[(data.sid == sid) & (data.termnum < termnum)]
+            if not len(df):
+                cache[(sid, termnum)] = []
+                return []
+            string = ' '.join(df.pcgrade)
+            cache[(sid, termnum)] = [string]
+            return [string]
+
+    return prior_cgrades
 
 
 def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
-                itemid='cid', cvals=None, rvals=None):
+                itemid='cid', cvals=None, rvals=None, prev_cgrades=False):
     """Write feature vectors in libFM format from a DataFrame. libFM uses the
     same format as libSVM. It takes feature vectors of the form:
 
@@ -65,6 +88,17 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
         max_idx = max(
             np.nanmax(train[cval].values), np.nanmax(test[cval].values)) + 1
 
+    # If requested, include ids for previous course grades.
+    # This relies on the presence of a 'pcid' key for previous course id.
+    if prev_cgrades:
+        alldata = pd.concat((train, test))
+        cid_range = alldata.cid.max() - alldata.cid.min()
+        ids_between = max_idx - alldata.cid.max()
+        diff = cid_range + ids_between
+        alldata['pcid'] = alldata['cid'] + diff
+        prior_cgrades = make_prev_crecord_fmter(alldata)
+        max_idx += len(alldata.cid.unique()) + 1
+
     rval_indices = np.arange(len(rvals)) + max_idx
 
     # Now we need to actually extract the cvals.
@@ -76,7 +110,12 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
         rval_part = \
             ['%d:%f' % (idx, series[key])
              for idx, key in zip(rval_indices, rvals) if ~np.isnan(series[key])]
-        pieces = pieces + cval_part + rval_part
+        if prev_cgrades:
+            pieces = (pieces + cval_part +
+                      prior_cgrades(series['sid'], series['termnum']) +
+                      rval_part)
+        else:
+            pieces = pieces + cval_part + rval_part
         return ' '.join(pieces)
 
     # TODO: consider adding chunksize param to reduce memory overhead.
