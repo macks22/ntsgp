@@ -1,3 +1,4 @@
+import sys
 import logging
 import warnings
 import argparse
@@ -87,38 +88,139 @@ def mean_of_means_baseline(train, test, value='grdpts', userid='sid',
     return to_predict
 
 
-#TODO: FINISH IMPLEMENTING
-def svd_baseline(train, test, userid='sid', itemid='cid', value='grdpts', k=5):
+def mean_of_means_fillna(matrix):
+    """Fill missing values in the np.ndarray using the mean of (1) the global
+    mean, (2) row-wise means, and (3) column-wise means. We assume a 2D array.
+    """
+    nan_mask = np.isnan(matrix)
+    masked = np.ma.masked_array(matrix, nan_mask)
+    global_mean = masked.mean()
+    row_means = masked.mean(axis=1)
+    col_means = masked.mean(axis=0)
+
+    n, m = matrix.shape
+    row_means = np.tile(row_means.reshape(n, 1), m)
+    col_means = np.tile(col_means.reshape(m, 1), n)
+    means = global_mean + row_means + col_means.T
+    matrix[nan_mask] = means
+
+
+def _closest_neighbor(V):
+    """Find k-nearest neighbors for each item in the matrix. We assume the
+    items are represented by the columns of `matrix`. We return a vector with
+    the closest neighbor for each movie.
+    """
+    sim = np.dot(V.T, V) / (sp.linalg.norm(V) * 2)
+    return sim.argmax(1)
+
+
+def svd_baseline(train, test, userid='sid', itemid='cid', value='grdpts', k=5,
+                 knn_post=False):
     """Fill values in `value` column of `test` data frame using values
-    calculated using a basic SVD.
+    calculated using a basic SVD. If `knn_post` is True, use kNN
+    post-processing. First find the most similar item in the V matrix. So cosine
+    similarity is calculated between all items using the latent factor
+    composition of each item. Then we reconstruct the original matrix using `k`
+    factors. Finally, we fill the value for each cell with the value of the
+    user's rating on the nearest neighbor of that item.
+
     """
     logging.info(
         'predicting %d values using SVD baseline' % len(test))
     to_predict = test.copy()
-    alldata = pd.concat((train, test))[[userid, itemid, value]]
+    alldata = pd.concat((train, to_predict))[[userid, itemid, value]]
     matrix = alldata.pivot(index=userid, columns=itemid, values=value)
-    mat = matrix.values
-    U, s, V = splinalg.svds(mat, k)
 
-    R = np.dot(U, V)
+    # Fill missing values with mean of means.
+    # mean_of_means_fillna(matrix)  # produces poor results.
+    matrix = matrix.fillna(matrix[~matrix.isnull()].mean().mean())
+
+    # Perform SVD on the matrix.
+    U, S, V = splinalg.svds(matrix.values, k)
+
+    if knn_post:
+        # Find most similar item for each item.
+        closest_item = _closest_neighbor(V)
+        closest = pd.Series(closest_item, matrix.columns)
+
+    # Reconstruct original matrix.
+    S = sp.linalg.diagsvd(S, U.shape[1], V.shape[0])
+    R = np.dot(np.dot(U, S), V)
     R[R < 0] = 0
-    R[R > 0] = 0
+    R[R > 4] = 4
 
+    # Convert back to Dataframe.
     df = pd.DataFrame(R)
     df.index = matrix.index
     df.columns = matrix.columns
-    df = df.unstack().reset_index().rename(columns={0: 'grdpts'})
 
-    mask = ((df[userid].isin(to_predict[userid])) &
-            (df[itemid].isin(to_predict[itemed])))
-    return df[mask]
+    if knn_post:
+        # Use knn postprocessing here.
+        df = df.apply(
+            lambda s: map(lambda cid: s.iloc[closest[cid]], s.index.values),
+            axis=1)
+
+    # Now convert back to original data frame, with missing values filled.
+    df = df.unstack().reset_index().rename(columns={0: value})
+    del to_predict[value]
+    return to_predict.merge(df, how='left', on=[userid, itemid])
+
+
+def svd_knn(train, test, userid='sid', itemid='cid', value='grdpts', k=5):
+    return svd_baseline(train, test, userid, itemid, value, k, knn_post=True)
+
+
+def svd_range(train, test, k_start, k_end, userid='sid', itemid='cid',
+              value='grdpts'):
+    """Fill values in `value` column of `test` data frame using values
+    calculated using a basic SVD. Reconstruct the matrix with a range of k
+    values, for comparison.
+    """
+    logging.info('predicting %d values using SVD baseline' % len(test))
+    k_vals = range(k_start, k_end + 1)
+    logging.info('using k values: %s' % ' '.join(map(str, k_vals)))
+    to_predict = test.copy()
+    alldata = pd.concat((train, to_predict))[[userid, itemid, value]]
+    matrix = alldata.pivot(index=userid, columns=itemid, values=value)
+
+    # Fill missing values with mean of means.
+    # mean_of_means_fillna(matrix)  # produces poor results.
+    matrix = matrix.fillna(matrix[~matrix.isnull()].mean().mean())
+
+    # Perform SVD on the matrix.
+    U, s, V = splinalg.svds(matrix.values, k_end)
+
+    # Reverse so singular values are in descending order.
+    n = len(s)
+    U[:,:n] = U[:, n-1::-1]   # reverse the n first columns of U
+    s = s[::-1]               # reverse s
+    V[:n, :] = V[n-1::-1, :]  # reverse the n first rows of vt
+
+    del to_predict[value]
+    for k in k_vals:
+        logging.info('reconstructing matrix using k=%d' % k)
+        # Reconstruct original matrix.
+        S = sp.linalg.diagsvd(s[:k], k, k)
+        R = np.dot(np.dot(U[:, :k], S), V[:k, :])
+        R[R < 0] = 0
+        R[R > 4] = 4
+
+        # Convert back to Dataframe.
+        df = pd.DataFrame(R)
+        df.index = matrix.index
+        df.columns = matrix.columns
+        df = df.unstack().reset_index().rename(columns={0: value})
+
+        # Use SVD-filled values to fill in missing grdpts.
+        predicted = to_predict.merge(df, how='left', on=[userid, itemid])
+        yield (k, predicted)
 
 
 def make_parser():
     parser = argparse.ArgumentParser(
         description='run baseline methods on dataset')
     parser.add_argument(
-        '-d', '--data-file', action='store',
+        'data_file', action='store',
         help='data file to run methods on')
     parser.add_argument(
         '-nt', '--ntest',
@@ -146,8 +248,8 @@ if __name__ == "__main__":
     cs = pd.read_csv(args.data_file, usecols=cols)
     cs = cs.sort(['sid', 'termnum'])
 
-    # Now let's take some data for testing. For each student, we take the last 2
-    # courses, or take 1 course if only has 1, or take none if only has 1.
+    # Now let's take some data for testing. For each student, we take the last
+    # 2 courses, or take 1 course if only has 1, or take none if only has 1.
     logging.info("splitting trian/test data")
     test = cs.groupby('sid').tail(args.ntest)
     train = cs[~cs.index.isin(test.index)]
@@ -168,15 +270,44 @@ if __name__ == "__main__":
 
     # Make predictions using baseline methods.
     logging.info('making predictions with baseline methods')
+    results = {}  # hold method_name: rmse
 
     ur_base = uniform_random_baseline(train, to_predict)
+    results['uniform random'] = rmse(ur_base, test)
     gm_base = global_mean_baseline(train, to_predict)
+    results['global mean'] = rmse(gm_base, test)
     ngm_base = gm_normal_baseline(train, to_predict)
+    results['normal'] = rmse(ngm_base, test)
     mom_base = mean_of_means_baseline(train, to_predict)
+    results['mean of means'] = rmse(mom_base, test)
 
-    print 'uniform random baseline rmse: %.5f' % rmse(ur_base, test)
-    print 'global mean baseline rmse:    %.5f' % rmse(gm_base, test)
-    print 'normal baseline rmse:         %.5f' % rmse(ngm_base, test)
-    print 'mean of means baseline rmse:  %.5f' % rmse(mom_base, test)
+    print 'uniform random baseline rmse:   %.5f' % results['uniform random']
+    print 'global mean baseline rmse:      %.5f' % results['global mean']
+    print 'normal baseline rmse:           %.5f' % results['normal']
+    print 'mean of means baseline rmse:    %.5f' % results['mean of means']
 
-    results = svd_baseline(train, to_predict)
+    # Evaluate using SVD for a variety of k values.
+    logging.info('making predictions using SVD...')
+    k_start = 1
+    best = (k_start, np.inf)  # best is start with max rmse to start
+    predicted = svd_range(train, to_predict, k_start=k_start, k_end=10)
+    for k, svd_base in predicted:
+        key = 'svd (k=%d)' % k
+        err = rmse(svd_base, test)
+        results[key] = err
+        if err < best[1]:  # new best RMSE from SVD
+            best = (k, err)
+        print 'svd baseline rmse (k=%d):\t%.5f' % (k, results[key])
+
+    # Now use kNN post-processing using best SVD results.
+    svd_knn_base = svd_knn(train, to_predict, k=best[0])
+    key = 'svd-knn (k=%d)' % best[0]
+    results[key] = rmse(svd_knn_base, test)
+    print 'svd-knn baseline rmse (k=%d):\t%.5f' % (best[0], results[key])
+
+    # Find top results.
+    pairs = results.items()
+    pairs.sort(key=lambda tup: tup[1])
+    print '\nTop 5 baselines:'
+    for name, err in pairs[:5]:
+        print '%s\t%.5f' % (name, err)
