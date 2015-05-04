@@ -117,12 +117,13 @@ def _closest_neighbor(V):
 def svd_baseline(train, test, userid='sid', itemid='cid', value='grdpts', k=5,
                  knn_post=False):
     """Fill values in `value` column of `test` data frame using values
-    calculated using a basic SVD. If `knn_post` is True, use kNN
-    post-processing. First find the most similar item in the V matrix. So cosine
-    similarity is calculated between all items using the latent factor
-    composition of each item. Then we reconstruct the original matrix using `k`
-    factors. Finally, we fill the value for each cell with the value of the
-    user's rating on the nearest neighbor of that item.
+    calculated using a basic SVD (no regularization, no bias terms).
+
+    If `knn_post` is True, use kNN post-processing. First find the most similar
+    item in the V matrix. So cosine similarity is calculated between all items
+    using the latent factor composition of each item. Then we reconstruct the
+    original matrix using `k` factors. Finally, we fill the value for each cell
+    with the value of the user's rating on the nearest neighbor of that item.
 
     """
     logging.info(
@@ -156,14 +157,14 @@ def svd_baseline(train, test, userid='sid', itemid='cid', value='grdpts', k=5,
 
     if knn_post:
         # Use knn postprocessing here.
-        df = df.apply(
-            lambda s: map(lambda cid: s.iloc[closest[cid]], s.index.values),
-            axis=1)
-
-    # Now convert back to original data frame, with missing values filled.
-    df = df.unstack().reset_index().rename(columns={0: value})
-    del to_predict[value]
-    return to_predict.merge(df, how='left', on=[userid, itemid])
+        to_predict['grdpts'] = to_predict.apply(
+            lambda s: df.ix[int(s['sid'])].iloc[closest[s['cid']]], axis=1)
+        return to_predict
+    else:
+        # Now convert back to original data frame, with missing values filled.
+        df = df.unstack().reset_index().rename(columns={0: value})
+        del to_predict[value]
+        return to_predict.merge(df, how='left', on=[userid, itemid])
 
 
 def svd_knn(train, test, userid='sid', itemid='cid', value='grdpts', k=5):
@@ -216,6 +217,108 @@ def svd_range(train, test, k_start, k_end, userid='sid', itemid='cid',
         yield (k, predicted)
 
 
+def split_xy(data, target='grdpts'):
+    return data.drop(target, axis=1).values, data[target].values
+
+def decision_tree_baseline(train, test, value='grdpts', max_depth=4):
+    """Fill values in `value` column of `test` data frame using the
+    DecisionTreeRegressor from scikit-learn.
+    """
+    to_predict = test.copy()
+    logging.info(
+        'predicting %d values using decision tree baseline' % len(test))
+
+    from sklearn import tree
+    clf = tree.DecisionTreeRegressor(max_depth=max_depth)
+
+    # Split up predictors/targets.
+    train_X, train_y = split_xy(train, value)
+    test_X, test_y = split_xy(to_predict, value)
+
+    # Learn model and make predictions.
+    clf = clf.fit(train_X, train_y)
+    predicted = clf.predict(test_X)
+    to_predict[value] = predicted
+    return to_predict
+
+
+def linear_regression_baseline(train, test, value='grdpts'):
+    """Fill values in `value` column of `test` data frame using the
+    LinearRegression from scikit-learn.
+    """
+    to_predict = test.copy()
+    logging.info(
+        'predicting %d values using decision tree baseline' % len(test))
+
+    from sklearn import linear_model
+    clf = linear_model.LinearRegression()
+
+    # Split up predictors/targets.
+    train_X, train_y = split_xy(train, value)
+    test_X, test_y = split_xy(to_predict, value)
+
+    # Learn model and make predictions.
+    clf = clf.fit(train_X, train_y)
+    predicted = clf.predict(test_X)
+    to_predict[value] = predicted
+    return to_predict
+
+
+def remove_cold_start(train, test, userid='sid', itemid='cid'):
+    """Remove users/items from the test set that are not in the training set.
+    """
+    for key in [userid, itemid]:
+        diff = np.setdiff1d(test[key].values, train[key].values)
+        logging.info(
+            "removing %d %s ids from the test set: %s" % (
+                len(diff), key, ' '.join(map(str, diff))))
+        cold_start = test[key].isin(diff)
+        test = test[~cold_start]
+
+    return test
+
+
+def eval_method(data, method, *args, **kwargs):
+    """Evaluate a particular baseline method `method` on the next-term
+    prediction task with the given `data`. We assume the `termnum` column is
+    present in the data and make predictions for each term by using all previous
+    terms as training data. Additional argument will be passed to the `method`
+    func.
+
+    """
+    results = {}  # key=termnum, val={'count': #, 'rmse': #}
+    for termnum in sorted(data['termnum'].unique()):
+        logging.info("making predictions for termnum %d" % termnum)
+        train = data[data['termnum'] < termnum]
+        test = data[data['termnum'] == termnum].copy()
+        test = remove_cold_start(train, test)
+        if len(test) == 0:
+            results[termnum] = {'count': 0, 'rmse': 0}
+            continue
+
+        to_predict = test.copy()
+        to_predict['grdpts'] = np.nan
+        predictions = method(train, to_predict, *args, **kwargs)
+        term_rmse = rmse(predictions, test)
+        results[termnum] = {'count': len(test), 'rmse': term_rmse}
+
+    sqerror = sum((result['rmse'] ** 2) * result['count']
+                  for result in results.values()
+                  if result['count'] > 0)
+    final_count = sum(result['count'] for result in results.values())
+    final_rmse = np.sqrt(sqerror / final_count)
+    results['all'] = {'count': final_count, 'rmse': final_rmse}
+    return results
+
+
+def read_data(fname):
+    """Read in necessary columns from data."""
+    logging.info("reading data from: %s" % fname)
+    cols = ['sid', 'cid', 'grdpts', 'termnum']
+    data = pd.read_csv(fname, usecols=cols)
+    return data.sort(['sid', 'termnum'])
+
+
 def make_parser():
     parser = argparse.ArgumentParser(
         description='run baseline methods on dataset')
@@ -242,68 +345,44 @@ if __name__ == "__main__":
         level=logging.INFO if args.verbose else logging.CRITICAL)
     warnings.simplefilter(action='ignore', category=FutureWarning)
 
-    # Read in necessary columns from data.
-    logging.info("reading data from: %s" % args.data_file)
-    cols = ['sid', 'cid', 'grdpts', 'termnum']
-    cs = pd.read_csv(args.data_file, usecols=cols)
-    cs = cs.sort(['sid', 'termnum'])
-
-    # Now let's take some data for testing. For each student, we take the last
-    # 2 courses, or take 1 course if only has 1, or take none if only has 1.
-    logging.info("splitting trian/test data")
-    test = cs.groupby('sid').tail(args.ntest)
-    train = cs[~cs.index.isin(test.index)]
-
-    # Transfer cold-start records back to train set.
-    for key in ['sid', 'cid']:
-        diff = np.setdiff1d(test[key].values, train[key].values)
-        logging.info(
-            "moving %d %s ids back to train set: %s" % (
-                len(diff), key, ' '.join(map(str, diff))))
-        cold_start = test[key].isin(diff)
-        train = pd.concat((train, test[cold_start]))
-        test = test[~cold_start]
-
-    # Now fill grdpts with nan values to get prediction dataset.
-    to_predict = test.copy()
-    to_predict['grdpts'] = np.nan
+    data = read_data(args.data_file)
 
     # Make predictions using baseline methods.
     logging.info('making predictions with baseline methods')
-    results = {}  # hold method_name: rmse
+    results = {}  # hold method_name: final_rmse
 
-    ur_base = uniform_random_baseline(train, to_predict)
-    results['uniform random'] = rmse(ur_base, test)
-    gm_base = global_mean_baseline(train, to_predict)
-    results['global mean'] = rmse(gm_base, test)
-    ngm_base = gm_normal_baseline(train, to_predict)
-    results['normal'] = rmse(ngm_base, test)
-    mom_base = mean_of_means_baseline(train, to_predict)
-    results['mean of means'] = rmse(mom_base, test)
+    methods = {
+        'uniform random': uniform_random_baseline,
+        'global mean': global_mean_baseline,
+        'normal': gm_normal_baseline,
+        'mean of means': mean_of_means_baseline,
+        'decision tree': decision_tree_baseline,
+        'linear regression': linear_regression_baseline
+    }
 
-    print 'uniform random baseline rmse:   %.5f' % results['uniform random']
-    print 'global mean baseline rmse:      %.5f' % results['global mean']
-    print 'normal baseline rmse:           %.5f' % results['normal']
-    print 'mean of means baseline rmse:    %.5f' % results['mean of means']
+    compute_rmse = lambda method: eval_method(data, method)['all']['rmse']
+
+    for method_name, func in methods.items():
+        results[method_name] = compute_rmse(func)
+        print '%s baseline rmse:\t%.5f' % (method_name, results[method_name])
 
     # Evaluate using SVD for a variety of k values.
     logging.info('making predictions using SVD...')
-    k_start = 1
+    k_start = 3
     best = (k_start, np.inf)  # best is start with max rmse to start
-    predicted = svd_range(train, to_predict, k_start=k_start, k_end=10)
-    for k, svd_base in predicted:
+    for k in range(k_start, 8):
         key = 'svd (k=%d)' % k
-        err = rmse(svd_base, test)
+        err = eval_method(data, svd_baseline, k=k)['all']['rmse']
         results[key] = err
         if err < best[1]:  # new best RMSE from SVD
             best = (k, err)
         print 'svd baseline rmse (k=%d):\t%.5f' % (k, results[key])
 
     # Now use kNN post-processing using best SVD results.
-    svd_knn_base = svd_knn(train, to_predict, k=best[0])
-    key = 'svd-knn (k=%d)' % best[0]
-    results[key] = rmse(svd_knn_base, test)
-    print 'svd-knn baseline rmse (k=%d):\t%.5f' % (best[0], results[key])
+    best_k = best[0]
+    key = 'svd-knn (k=%d)' % best_k
+    results[key] = eval_method(data, svd_knn)['all']['rmse']
+    print 'svd-knn baseline rmse (k=%d):\t%.5f' % (best_k, results[key])
 
     # Find top results.
     pairs = results.items()
