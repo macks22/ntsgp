@@ -1,4 +1,3 @@
-import sys
 import logging
 import warnings
 import argparse
@@ -7,30 +6,9 @@ import numpy as np
 import pandas as pd
 import scipy as sp
 from scipy.sparse import linalg as splinalg
+from sklearn import svm, linear_model, ensemble, tree, neighbors, preprocessing
 
-
-def rmse(predicted, actual, userid='sid', itemid='cid', value='grdpts'):
-    """Compute root mean squared error between the predicted values and the
-    actual values. This assumes some values are missing and only incorporates
-    error measurements from the values present in the actual values.
-
-    `actual` and `predicted` should be DataFrame objects with feature vectors
-    for each data instance. The rmse is computed on the column named by `value`.
-    """
-    name_x = '%s_x' % value
-    name_y = '%s_y' % value
-    to_eval = actual.merge(predicted, how='left', on=[userid, itemid])
-    to_eval = to_eval[[name_x, name_y]]  # filter down only to values
-
-    # Sanity check; we don't want nan values here; that indicates no predictions
-    # were made for some records.
-    if to_eval.isnull().sum().sum() > 0:
-        raise ValueError("predictions must be made for all missing values")
-
-    # Compute error.
-    error = (to_eval[name_x] - to_eval[name_y]).values
-    mse = (error ** 2).sum() / len(error)
-    return np.sqrt(mse)
+from scaffold import read_data, rmse, eval_method
 
 
 def uniform_random_baseline(train, test, value='grdpts'):
@@ -220,103 +198,54 @@ def svd_range(train, test, k_start, k_end, userid='sid', itemid='cid',
 def split_xy(data, target='grdpts'):
     return data.drop(target, axis=1).values, data[target].values
 
-def decision_tree_baseline(train, test, value='grdpts', max_depth=4):
-    """Fill values in `value` column of `test` data frame using the
-    DecisionTreeRegressor from scikit-learn.
-    """
-    to_predict = test.copy()
-    logging.info(
-        'predicting %d values using decision tree baseline' % len(test))
-
-    from sklearn import tree
-    clf = tree.DecisionTreeRegressor(max_depth=max_depth)
-
-    # Split up predictors/targets.
-    train_X, train_y = split_xy(train, value)
-    test_X, test_y = split_xy(to_predict, value)
-
-    # Learn model and make predictions.
-    clf = clf.fit(train_X, train_y)
-    predicted = clf.predict(test_X)
-    to_predict[value] = predicted
-    return to_predict
-
-
-def linear_regression_baseline(train, test, value='grdpts'):
-    """Fill values in `value` column of `test` data frame using the
-    LinearRegression from scikit-learn.
-    """
-    to_predict = test.copy()
-    logging.info(
-        'predicting %d values using decision tree baseline' % len(test))
-
-    from sklearn import linear_model
-    clf = linear_model.LinearRegression()
-
-    # Split up predictors/targets.
-    train_X, train_y = split_xy(train, value)
-    test_X, test_y = split_xy(to_predict, value)
-
-    # Learn model and make predictions.
-    clf = clf.fit(train_X, train_y)
-    predicted = clf.predict(test_X)
-    to_predict[value] = predicted
-    return to_predict
-
-
-def remove_cold_start(train, test, userid='sid', itemid='cid'):
-    """Remove users/items from the test set that are not in the training set.
-    """
-    for key in [userid, itemid]:
-        diff = np.setdiff1d(test[key].values, train[key].values)
-        logging.info(
-            "removing %d %s ids from the test set: %s" % (
-                len(diff), key, ' '.join(map(str, diff))))
-        cold_start = test[key].isin(diff)
-        test = test[~cold_start]
-
-    return test
-
-
-def eval_method(data, method, *args, **kwargs):
-    """Evaluate a particular baseline method `method` on the next-term
-    prediction task with the given `data`. We assume the `termnum` column is
-    present in the data and make predictions for each term by using all previous
-    terms as training data. Additional argument will be passed to the `method`
-    func.
-
-    """
-    results = {}  # key=termnum, val={'count': #, 'rmse': #}
-    for termnum in sorted(data['termnum'].unique()):
-        logging.info("making predictions for termnum %d" % termnum)
-        train = data[data['termnum'] < termnum]
-        test = data[data['termnum'] == termnum].copy()
-        test = remove_cold_start(train, test)
-        if len(test) == 0:
-            results[termnum] = {'count': 0, 'rmse': 0}
-            continue
-
+SKLEARN_MODELS = {}
+def sklearn_model(model_class, *args, **kwargs):
+    def model(train, test, value='grdpts'):
         to_predict = test.copy()
-        to_predict['grdpts'] = np.nan
-        predictions = method(train, to_predict, *args, **kwargs)
-        term_rmse = rmse(predictions, test)
-        results[termnum] = {'count': len(test), 'rmse': term_rmse}
+        logging.info(
+            'predicting %d values using %s' % (
+                len(test), model_class.__name__))
+        clf = model_class(*args, **kwargs)
 
-    sqerror = sum((result['rmse'] ** 2) * result['count']
-                  for result in results.values()
-                  if result['count'] > 0)
-    final_count = sum(result['count'] for result in results.values())
-    final_rmse = np.sqrt(sqerror / final_count)
-    results['all'] = {'count': final_count, 'rmse': final_rmse}
-    return results
+        # Split up predictors/targets.
+        train_X, train_y = split_xy(train, value)
+        test_X, test_y = split_xy(test, value)
+        scaler = preprocessing.StandardScaler().fit(train_X)
+        train_X = scaler.transform(train_X)
+        test_X = scaler.transform(test_X)
+
+        # Learn model and make predictions.
+        clf = clf.fit(train_X, train_y)
+        predicted = clf.predict(test_X)
+        to_predict[value] = predicted
+        return to_predict
+
+    SKLEARN_MODELS[model_class.__name__] = model
+    return model
 
 
-def read_data(fname):
-    """Read in necessary columns from data."""
-    logging.info("reading data from: %s" % fname)
-    cols = ['sid', 'cid', 'grdpts', 'termnum']
-    data = pd.read_csv(fname, usecols=cols)
-    return data.sort(['sid', 'termnum'])
+decision_tree_baseline = sklearn_model(
+    tree.DecisionTreeRegressor, max_depth=4)
+
+linear_regression_baseline = sklearn_model(
+    linear_model.LinearRegression)
+
+sgd_regression_baseline = sklearn_model(
+    linear_model.SGDRegressor, n_iter=10, penalty='l1')
+
+knn_regression_baseline = sklearn_model(
+    neighbors.KNeighborsRegressor, n_neighbors=20)
+
+random_forest_baseline = sklearn_model(
+    ensemble.RandomForestRegressor, n_estimators=100, max_depth=10)
+
+boosted_decision_tree_baseline = sklearn_model(
+    ensemble.AdaBoostRegressor,
+    base_estimator=tree.DecisionTreeRegressor(max_depth=4),
+    n_estimators=100)
+
+svm_baseline = sklearn_model(
+    svm.SVR, C=1.7, epsilon=0.6, gamma=0.02, cache_size=5000)
 
 
 def make_parser():
@@ -325,10 +254,6 @@ def make_parser():
     parser.add_argument(
         'data_file', action='store',
         help='data file to run methods on')
-    parser.add_argument(
-        '-nt', '--ntest',
-        type=int, default=2,
-        help='number of records for each student to test on; default 2')
     parser.add_argument(
         '-v', '--verbose',
         action='store_true', default=False,
@@ -351,26 +276,29 @@ if __name__ == "__main__":
     logging.info('making predictions with baseline methods')
     results = {}  # hold method_name: final_rmse
 
-    methods = {
+    basic_methods = {
         'uniform random': uniform_random_baseline,
         'global mean': global_mean_baseline,
         'normal': gm_normal_baseline,
-        'mean of means': mean_of_means_baseline,
-        'decision tree': decision_tree_baseline,
-        'linear regression': linear_regression_baseline
+        'mean of means': mean_of_means_baseline
     }
 
-    compute_rmse = lambda method: eval_method(data, method)['all']['rmse']
+    def compute_rmse(method, dropna):
+        return eval_method(data, method, dropna)['all']['rmse']
 
-    for method_name, func in methods.items():
-        results[method_name] = compute_rmse(func)
+    for method_name, func in basic_methods.items():
+        results[method_name] = compute_rmse(func, False)
+        print '%s baseline rmse:\t%.5f' % (method_name, results[method_name])
+
+    for method_name, func in SKLEARN_MODELS.items():
+        results[method_name] = compute_rmse(func, True)
         print '%s baseline rmse:\t%.5f' % (method_name, results[method_name])
 
     # Evaluate using SVD for a variety of k values.
     logging.info('making predictions using SVD...')
-    k_start = 3
+    k_start = 4
     best = (k_start, np.inf)  # best is start with max rmse to start
-    for k in range(k_start, 8):
+    for k in range(k_start, 7):
         key = 'svd (k=%d)' % k
         err = eval_method(data, svd_baseline, k=k)['all']['rmse']
         results[key] = err
