@@ -241,7 +241,7 @@ random_forest_baseline = sklearn_model(
 
 boosted_decision_tree_baseline = sklearn_model(
     ensemble.AdaBoostRegressor,
-    base_estimator=tree.DecisionTreeRegressor(max_depth=4),
+    base_estimator=tree.DecisionTreeRegressor(max_depth=11),
     n_estimators=100)
 
 svm_baseline = sklearn_model(
