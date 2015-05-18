@@ -20,6 +20,10 @@ def make_parser():
         '-m', '--max-depth',
         type=int, default=4,
         help='max depth to grow the tree to')
+    parser.add_argument(
+        '-o', '--out-tree',
+        type=int, default=14,
+        help='output dot file with decision tree learned on this termnum')
     return parser
 
 
@@ -42,6 +46,7 @@ if __name__ == "__main__":
     params = {'max_depth': args.max_depth}
     if args.forest:
         params['n_estimators'] = args.forest
+
     if args.task == 'r':
         if 'GRADE' in data:
             del data['GRADE']
@@ -56,7 +61,18 @@ if __name__ == "__main__":
     print 'RMSE: %.5f' % eval_method(data, clf, True)['all']['rmse']
 
     # Write out decision tree.
-    # if not args.forest:
-    #     with open('cs-dec-tree.dot', 'w') as f:
-    #         f = tree.export_graphviz(clf, out_file=f)
+    if args.out_tree and not args.forest:
+        for feature in ['sid', 'cid']:
+            data = quiet_delete(data, feature)
+
+        # Learn classifier for last term prediction.
+        train_X, train_y, test_X, test_y = train_test_for_term(
+            data, 14, target)
+
+        del params['_value']
+        clf = model_class(**params)
+        clf = clf.fit(train_X, train_y)
+        cols = data.drop(target, axis=1).columns
+        with open('dec-tree.dot', 'w') as f:
+            f = tree.export_graphviz(clf, out_file=f, feature_names=cols)
 
