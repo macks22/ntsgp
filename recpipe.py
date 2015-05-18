@@ -6,9 +6,8 @@ import luigi
 import numpy as np
 import pandas as pd
 
-import test_params
 from util import *
-from writer import *
+from methods.writer import *
 
 
 MAX_NUM_COHORTS = 14
@@ -133,9 +132,9 @@ grade2pts = {
     'D':    1.00,
     'F':    0.00,
     'IN':   0.00,    # Incomplete
-    'S':    3.00,    # Satisfactory (passing; C and up, no effect on GPA)
-    'NC':   1.00,    # No Credit (often C- and below)
-    'W':    1.00,    # Withdrawal (does not affect grade)
+    'S':    np.nan,  # Satisfactory (passing; C and up, no effect on GPA)
+    'NC':   np.nan,  # No Credit (often C- and below)
+    'W':    np.nan,  # Withdrawal (does not affect grade)
     'NR':   np.nan,  # Not Reported (possibly honor code violation)
     'AU':   np.nan,  # Audit
     'REG':  np.nan,  # ?
@@ -217,6 +216,10 @@ def extract_clevel(cnum):
 class PreprocessedData(BasicLuigiTask):
     """Clean up courses data to prepare for learning tasks."""
 
+    # TEMPORARY HACK FOR PREDICTION ON OTHER DATASETS.
+    # def output(self):
+    #     return luigi.LocalTarget('baselines/preprocessed-cs-students.csv')
+
     attributes = {
         'sid': 1, 'cdisc': 0, 'cid': 0, 'iid': 1, 'termnum': 1,
         'iclass': 1, 'irank': 1, 'itenure': 1, 'zip': 1, 'hs': 1,
@@ -227,13 +230,15 @@ class PreprocessedData(BasicLuigiTask):
     # Combine rvals from data and those produced from feature engineering.
     rvals = ['grdpts', 'age', 'hsgpa', 'sat', 'chrs', 'clevel'] + ['lterm_gpa',
             'lterm_cum_gpa', 'total_chrs', 'num_enrolled', 'lterm_cgpa',
-            'lterm_cum_cgpa']
+            'lterm_cum_cgpa', 'total_enrolled', 'term_chrs']
 
     # Finally, create dict of all data source tasks and attribute mapping tasks
     # to be required by this task.
     data_tasks = {src_name: task() for src_name, task in DATA_TASKS.items()}
     idmap_classes = [IDMAP_TASKS[attr] for attr in cvals]
     idmap_tasks = {klass.__name__: klass() for klass in idmap_classes}
+
+    cvals += ['cohort']
 
     def requires(self):
         sources = self.data_tasks.copy()
@@ -320,6 +325,10 @@ class PreprocessedData(BasicLuigiTask):
 
         # Feature engineering.
         data = self.engineer_features(data)
+
+        # Narrow down features to those which can be used.
+        allvals = self.cvals + self.rvals
+        data = data[allvals]
 
         # Write cleaned up data.
         with self.output().open('w') as out:
@@ -569,13 +578,13 @@ class DataSplitterBaseTask(UsesFeatures):
         train = pd.concat((train, test[oddball_mask]))
         test = test[~oddball_mask]
 
-        # remove W/S/NC from test set; it never makes sense to test on these
-        toremove = ['W', 'S', 'NC']
-        test = test[~test.GRADE.isin(toremove)]
+        # # remove W/S/NC from test set; it never makes sense to test on these
+        # toremove = ['W', 'S', 'NC']
+        # test = test[~test.GRADE.isin(toremove)]
 
-        # optionally discard W/S/NC from train set
-        if self.discard_nongrade:
-            train = train[~train.GRADE.isin(toremove)]
+        # # optionally discard W/S/NC from train set
+        # if self.discard_nongrade:
+        #     train = train[~train.GRADE.isin(toremove)]
 
         return (train, test)
 

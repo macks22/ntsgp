@@ -7,7 +7,7 @@ import luigi
 import numpy as np
 import pandas as pd
 
-import test_params
+from methods import libfm
 from util import *
 import summary
 from recpipe import UserCourseGradeLibFM, UsesFeatures
@@ -20,14 +20,17 @@ class UnexpectedNaN(Exception):
 
 class UsesLibFM(UsesFeatures):
     """Base class for any class that uses libFM to produce results."""
-    task = luigi.Parameter(
+    ptask = luigi.Parameter(
         default='next',
         description='prediction task; next = next-term, all = all-terms')
+    task = luigi.Parameter(
+        default='r',
+        description='libFM task to run; default is regression; c is classify')
     iterations = luigi.IntParameter(
-        default=150,
+        default=100,
         description='number of iterations to use for learning')
     init_stdev = luigi.FloatParameter(
-        default=0.5,
+        default=0.2,
         description='initial std of Gaussian spread; higher can be faster')
     use_bias = luigi.BoolParameter(
         default=False,
@@ -47,6 +50,11 @@ class UsesLibFM(UsesFeatures):
         # Add feature names (abbreviated) to path name.
         if self.features:
             parts.append(abbrev_names(self.features))
+
+        if self.prev_cgrades:
+            parts.append('Pcgr')
+
+        parts.append('t%s' % self.task)
 
         # number of iterations part
         parts.append('i%d' % self.iterations)
@@ -94,27 +102,28 @@ class UsesLibFM(UsesFeatures):
             'dim': self.dim,
             'std': self.init_stdev,
             'bias': self.use_bias,
-            'iter': self.iterations
+            'iter': self.iterations,
+            'task': self.task
         }
 
     @property
     def libfm_command(self):
         def show_libfm_command(train_fname, test_fname, outfile=''):
-            return ' '.join(test_params.compose_libfm_args(
+            return ' '.join(libfm.compose_libfm_args(
                 train_fname, test_fname, outfile=outfile, **self.common_kwargs))
         return show_libfm_command
 
     @property
     def run_libfm(self):
         def run_libfm(train_fname, test_fname, outfile=''):
-            return test_params.run_libfm(
+            return libfm.run_libfm(
                 train_fname, test_fname, outfile=outfile, **self.common_kwargs)
         return run_libfm
 
     @property
     def libfm_predict(self):
         def libfm_predict(train_fname, test_fname, outfile):
-            return test_params.libfm_predict(
+            return libfm.libfm_predict(
                 train_fname, test_fname, outfile=outfile, **self.common_kwargs)
         return libfm_predict
 
@@ -129,7 +138,7 @@ class RunLibFM(UsesLibFM):
 
     @property
     def guide(self):
-        if self.task == 'all':
+        if self.ptask == 'all':
             with self.input()['guide'].open() as f:
                 return pd.read_csv(f, index_col=0)
         else:
@@ -137,7 +146,7 @@ class RunLibFM(UsesLibFM):
 
     @property
     def term_range(self):
-        if self.task ==  'all':
+        if self.ptask ==  'all':
             return self.guide.index
         else:
             return self.subtask.term_range
@@ -145,7 +154,7 @@ class RunLibFM(UsesLibFM):
     @property
     def base_outfile_name(self):
         parts = self.libfm_arg_indicators
-        parts.append('aterm' if self.task == 'all' else 'nterm')
+        parts.append('aterm' if self.ptask == 'all' else 'nterm')
         self.suffix = '-'.join(parts)
         return self.output_base_fname()
 
@@ -155,7 +164,7 @@ class RunLibFM(UsesLibFM):
         error_ext = '{}.rmse'.format(self.__class__.__name__)
         error_fname = base_fname % error_ext
 
-        if self.task == 'next':
+        if self.ptask == 'next':
             outputs = \
                 {termnum: luigi.LocalTarget(base_fname % (subext % termnum))
                  for termnum in self.term_range}
@@ -186,10 +195,11 @@ class RunLibFM(UsesLibFM):
 
             # Now calculate absolute deviation of predictions from actuals
             with test_file.open() as f:
-                test = pd.read_csv(f, sep=' ', usecols=[0], header=None)
-                test = test.values[:,0]
+                rows = (l.split() for l in f if l.strip())
+                test = np.array([float(row[0]) for row in rows])
 
-            error[termnum] = abs(predicted - test) ** 2
+            assert(len(predicted) == len(test))
+            error[termnum] = (predicted - test) ** 2
 
         return error
 
@@ -231,37 +241,30 @@ class RunLibFM(UsesLibFM):
             last_rownum = guide.rownum[termnum] + 1
             predicted = results[pos: last_rownum]
             testvals = test[pos: last_rownum]
-            error[termnum] = abs(predicted - testvals) ** 2
+            error[termnum] = (predicted - testvals) ** 2
             pos = last_rownum
 
         return error
 
     def run(self):
         # Calculate squred error per term
-        if self.task == 'all':
-            sqerror = self.all_term_prediction()
-        else:
-            sqerror = self.next_term_prediction()
+        sqerror = (self.all_term_prediction() if self.ptask == 'all'
+                   else self.next_term_prediction())
 
         # compute rmse by term and over all terms
-        err_arrays = sqerror.values()
+        err_arrays = sqerror.values()  # OrderedDict
         counts = np.array([len(errvals) for errvals in err_arrays])
         err_sums = np.array([errvals.sum() for errvals in err_arrays])
         rmse_vals = np.sqrt(err_sums / counts)
 
         # compute running mean
-        running_mean = [rmse_vals[0]]
-        total_cnt = counts[0]
-        for i in range(1, len(rmse_vals)):
-            newcount = total_cnt + counts[i]
-            running_mean.append(
-                ((running_mean[i-1] * total_cnt + rmse_vals[i] * counts[i]) /
-                 newcount))
-            total_cnt = newcount
+        cum_counts = counts.cumsum()
+        cum_err_sums = err_sums.cumsum()
+        running_rmse = np.sqrt(cum_err_sums / cum_counts)
 
         # write all error calculations
         rmse_vals = ['%.5f' % val for val in rmse_vals]
-        running_vals = ['%.5f' % val for val in running_mean]
+        running_vals = ['%.5f' % val for val in running_rmse]
         header = ['term%d' % tnum for tnum in sqerror]
         with self.output()['error'].open('w') as f:
             f.write('\t'.join(header) + '\n')
