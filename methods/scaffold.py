@@ -112,7 +112,7 @@ def eval_method(data, method, dropna=False, *args, **kwargs):
         train = data[data['termnum'] < termnum]
         test = data[data['termnum'] == termnum].copy()
         test = remove_cold_start(train, test)
-        if len(test) == 0:
+        if len(test) == 0 or len(train) == 0:
             results[termnum] = {'count': 0, 'rmse': 0}
             continue
 
@@ -130,8 +130,14 @@ def eval_method(data, method, dropna=False, *args, **kwargs):
     results['all'] = {'count': final_count, 'rmse': final_rmse}
     return results
 
+def quiet_delete(data, col):
+    try:
+        return data.drop(col, axis=1)
+    except:
+        return data
 
 def sklearn_model(model_class, *args, **kwargs):
+    # Change target column if requested.
     value = kwargs.get('_value', 'grdpts')
     try: del kwargs['_value']
     except: pass
@@ -143,9 +149,13 @@ def sklearn_model(model_class, *args, **kwargs):
                 len(test), model_class.__name__))
         clf = model_class(*args, **kwargs)
 
+        for feature in ['sid', 'cid']:
+            train = quiet_delete(train, feature)
+            to_predict = quiet_delete(to_predict, feature)
+
         # Split up predictors/targets.
         train_X, train_y = split_xy(train, value)
-        test_X, test_y = split_xy(test, value)
+        test_X, test_y = split_xy(to_predict, value)
         scaler = preprocessing.StandardScaler().fit(train_X)
         train_X = scaler.transform(train_X)
         test_X = scaler.transform(test_X)
@@ -154,6 +164,9 @@ def sklearn_model(model_class, *args, **kwargs):
         clf = clf.fit(train_X, train_y)
         predicted = clf.predict(test_X)
         to_predict[value] = predicted
+
+        to_predict = to_predict.merge(
+            test[['sid', 'cid']], how='left', left_index=True, right_index=True)
         return to_predict
 
     return model
