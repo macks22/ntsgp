@@ -1,6 +1,8 @@
+import time
 import logging
 import warnings
 import argparse
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -9,6 +11,19 @@ from scipy.sparse import linalg as splinalg
 from sklearn import svm, linear_model, ensemble, tree, neighbors, preprocessing
 
 from scaffold import read_data, rmse, eval_method
+from libfm import libfm_model2
+
+
+def gen_ts():
+    ts = time.time()
+    st = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d-%H-%M-%S')
+    return st
+
+def eval_fm(train, test):
+    outdir = gen_ts()
+    return libfm_model2(
+        train, test, outdir=outdir, iter=200, std=0.2, dim=8, bias=True,
+        task='r')
 
 
 def uniform_random_baseline(train, test, value='grdpts'):
@@ -284,15 +299,20 @@ if __name__ == "__main__":
     }
 
     def compute_rmse(method, dropna):
-        return eval_method(data, method, dropna)['all']['rmse']
+        return eval_method(data, method, dropna)['all']
+
+    def print_result(method_name):
+        result = results[method_name]
+        print '%s RMSE:\t%.4f\tMAE:\t%.4f' % (
+            method_name, result['rmse'], result['mae'])
 
     for method_name, func in basic_methods.items():
         results[method_name] = compute_rmse(func, False)
-        print '%s baseline rmse:\t%.5f' % (method_name, results[method_name])
+        print_result(method_name)
 
     for method_name, func in SKLEARN_MODELS.items():
         results[method_name] = compute_rmse(func, True)
-        print '%s baseline rmse:\t%.5f' % (method_name, results[method_name])
+        print_result(method_name)
 
     # Evaluate using SVD for a variety of k values.
     logging.info('making predictions using SVD...')
@@ -300,21 +320,26 @@ if __name__ == "__main__":
     best = (k_start, np.inf)  # best is start with max rmse to start
     for k in range(k_start, 7):
         key = 'svd (k=%d)' % k
-        err = eval_method(data, svd_baseline, k=k)['all']['rmse']
-        results[key] = err
+        result = eval_method(data, svd_baseline, k=k)['all']
+        results[key] = result
+        err = result['rmse']
         if err < best[1]:  # new best RMSE from SVD
             best = (k, err)
-        print 'svd baseline rmse (k=%d):\t%.5f' % (k, results[key])
+        print_result(key)
 
     # Now use kNN post-processing using best SVD results.
     best_k = best[0]
     key = 'svd-knn (k=%d)' % best_k
-    results[key] = eval_method(data, svd_knn)['all']['rmse']
-    print 'svd-knn baseline rmse (k=%d):\t%.5f' % (best_k, results[key])
+    results[key] = eval_method(data, svd_knn)['all']
+    print_result(key)
+
+    # Finally, train/evaluate libFM.
+    results['LibFM'] = eval_method(data, eval_fm, False)['all']
+    print_result('LibFM')
 
     # Find top results.
     pairs = results.items()
     pairs.sort(key=lambda tup: tup[1])
-    print '\nTop 5 baselines:'
-    for name, err in pairs[:5]:
-        print '%s\t%.5f' % (name, err)
+    print '\nTop 5 methods:'
+    for name, result in pairs[:5]:
+        print '%s\t%.4f\t%.4f' % (name, result['rmse'], result['mae'])
