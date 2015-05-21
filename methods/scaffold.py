@@ -4,8 +4,11 @@ import logging
 import numpy as np
 import pandas as pd
 from sklearn import preprocessing
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 sys.path.append('../')
+sys.path.append('/home/msweene2/ers-data/')
 from recpipe import PreprocessedData
 
 
@@ -15,8 +18,14 @@ def split_xy(data, target='GRADE'):
 def split_train_test(data, termnum):
     return data[data.termnum < termnum], data[data.termnum == termnum]
 
-def train_test_for_term(data, termnum, target='grdpts'):
-    train, test = split_train_test(data, 11)
+def train_test_for_term(data, termnum, target='grdpts', cold_start=True):
+    train, test = split_train_test(data, termnum)
+
+    if not cold_start:
+        test = remove_cold_start(train, test)
+
+    if len(test) == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
 
     # Split up predictors/targets.
     train_X, train_y = split_xy(train, target)
@@ -36,14 +45,15 @@ def _rmse(predicted, actual):
     return np.sqrt(mse)
 
 
-def read_data(fname):
+def read_data(fname, usecols=['sid', 'cid', 'grdpts', 'termnum']):
     """Read in necessary columns from data."""
     logging.info("reading data from: %s" % fname)
 
     # Only read needed columns.
     task = PreprocessedData()
-    cols = ['sid', 'cid', 'grdpts', 'termnum']
-    features = list(set(task.rvals + cols))
+    if not usecols:
+        usecols = task.cvals
+    features = list(set(task.rvals + usecols))
 
     data = pd.read_csv(fname, usecols=features)
     return data.sort(['sid', 'termnum'])
@@ -59,14 +69,13 @@ def compute_rmse(clf, data, termnum, target='grdpts'):
     return _rmse(predicted, test_y)
 
 
-def rmse(predicted, actual, userid='sid', itemid='cid', value='grdpts'):
-    """Compute root mean squared error between the predicted values and the
-    actual values. This assumes some values are missing and only incorporates
-    error measurements from the values present in the actual values.
+def _compute_error(predicted, actual, userid='sid', itemid='cid',
+                  value='grdpts', bounds=(0, 4)):
+    # Bound predictions.
+    low, high = bounds
+    predicted[predicted[value] > high][value] = high
+    predicted[predicted[value] < low][value] = low
 
-    `actual` and `predicted` should be DataFrame objects with feature vectors
-    for each data instance. The rmse is computed on the column named by `value`.
-    """
     name_x = '%s_x' % value
     name_y = '%s_y' % value
     to_eval = actual.merge(predicted, how='left', on=[userid, itemid])
@@ -77,26 +86,102 @@ def rmse(predicted, actual, userid='sid', itemid='cid', value='grdpts'):
     if to_eval.isnull().sum().sum() > 0:
         raise ValueError("predictions must be made for all missing values")
 
-    # Compute error.
-    error = (to_eval[name_x] - to_eval[name_y]).values
+    return (to_eval[name_x] - to_eval[name_y]).values
+
+
+def rmse(predicted, actual, userid='sid', itemid='cid', value='grdpts'):
+    """Compute root mean squared error between the predicted values and the
+    actual values. This assumes some values are missing and only incorporates
+    error measurements from the values present in the actual values.
+
+    `actual` and `predicted` should be DataFrame objects with feature vectors
+    for each data instance. The rmse is computed on the column named by `value`.
+    """
+    error = _compute_error(predicted, actual, userid, itemid, value)
     mse = (error ** 2).sum() / len(error)
     return np.sqrt(mse)
 
+def mae(predicted, actual, userid='sid', itemid='cid', value='grdpts'):
+    error = _compute_error(predicted, actual, userid, itemid, value)
+    return abs(error).sum() / len(error)
+
 
 def remove_cold_start(train, test, userid='sid', itemid='cid'):
-    """Remove users/items from the test set that are not in the training set.
-    """
+    """Remove users/items from test set that are not in the train set."""
     for key in [userid, itemid]:
         diff = np.setdiff1d(test[key].values, train[key].values)
         logging.info(
-            "removing %d %s ids from the test set: %s" % (
-                len(diff), key, ' '.join(map(str, diff))))
+            "removing %d %s ids from the test set." % (len(diff), key))
+        logging.debug(' '.join(map(str, diff)))
         cold_start = test[key].isin(diff)
         test = test[~cold_start]
 
     return test
 
 
+def run_method(data, method, dropna=False, *args, **kwargs):
+    """Evaluate a particular baseline method `method` on the next-term
+    prediction task with the given `data`. We assume the `termnum` column is
+    present in the data and make predictions for each term by using all previous
+    terms as training data. Additional argument will be passed to the `method`
+    func.
+
+    """
+    data = data.dropna() if dropna else data
+    terms = list(sorted(data['termnum'].unique()))
+
+    for termnum in terms:
+        logging.info("making predictions for termnum %d" % termnum)
+        train = data[data['termnum'] < termnum]
+        test = data[data['termnum'] == termnum].copy()
+        test = remove_cold_start(train, test)
+        if len(test) == 0 or len(train) == 0:
+            yield (termnum, np.array([]), np.array([]))
+            continue
+
+        to_predict = test.copy()
+        to_predict['grdpts'] = np.nan
+        predictions = method(train, to_predict, *args, **kwargs)
+        yield (termnum, predictions, test)
+
+
+def method_error(data, method, dropna=False, *args, **kwargs):
+    results = pd.DataFrame()
+    evaluator = run_method(data, method, dropna, *args, **kwargs)
+    for termnum, predictions, test in evaluator:
+        if not len(predictions) == 0 and not len(test) == 0:
+            keep_cols= ['sid', 'cid', 'termnum', 'major', 'sterm', 'grdpts']
+            df = test[keep_cols].copy()
+            df['pred'] = predictions['grdpts']
+            df['error'] = _compute_error(predictions, test)
+            results = pd.concat((results, df))
+
+    return results
+
+
+def eval_results(results, by='termnum'):
+    """Given results which include the error for each prediction, return an
+    evaluation in terms of (1) RMSE, (2) MAE, (3) record count.
+    """
+    rmse = results.groupby(by).apply(
+        lambda df: np.sqrt((df['error'].values ** 2).sum() / len(df)))
+    mae = results.groupby(by).apply(
+        lambda df: abs(df['error'].values).sum() / len(df))
+    counts = results.groupby(by)['error'].count()
+
+    total_count = len(results)
+    rmse['all'] = np.sqrt((rmse**2 * counts).sum() / total_count)
+    mae['all'] = (mae * counts).sum() / total_count
+    counts['all'] = total_count
+
+    results = pd.DataFrame()
+    results['rmse'] = rmse
+    results['mae'] = mae
+    results['counts'] = counts
+    return results
+
+
+# TODO: DEPRECATE
 def eval_method(data, method, dropna=False, *args, **kwargs):
     """Evaluate a particular baseline method `method` on the next-term
     prediction task with the given `data`. We assume the `termnum` column is
@@ -106,29 +191,131 @@ def eval_method(data, method, dropna=False, *args, **kwargs):
 
     """
     results = {}  # key=termnum, val={'count': #, 'rmse': #}
-    data = data.dropna() if dropna else data
-    for termnum in sorted(data['termnum'].unique()):
-        logging.info("making predictions for termnum %d" % termnum)
-        train = data[data['termnum'] < termnum]
-        test = data[data['termnum'] == termnum].copy()
-        test = remove_cold_start(train, test)
-        if len(test) == 0 or len(train) == 0:
-            results[termnum] = {'count': 0, 'rmse': 0}
-            continue
-
-        to_predict = test.copy()
-        to_predict['grdpts'] = np.nan
-        predictions = method(train, to_predict, *args, **kwargs)
-        term_rmse = rmse(predictions, test)
-        results[termnum] = {'count': len(test), 'rmse': term_rmse}
+    evaluator = run_method(data, method, dropna, *args, **kwargs)
+    for termnum, predictions, test in evaluator:
+        if len(predictions) == 0 or len(test) == 0:
+            results[termnum] = {'count': 0, 'rmse': 0.0, 'mae': 0.0}
+        else:
+            results[termnum] = {
+                'count': len(test),
+                'rmse': rmse(predictions, test),
+                'mae': mae(predictions, test)
+            }
 
     sqerror = sum((result['rmse'] ** 2) * result['count']
                   for result in results.values()
                   if result['count'] > 0)
+    abserror = sum(result['mae'] * result['count']
+                   for result in results.values()
+                   if result['count'] > 0)
     final_count = sum(result['count'] for result in results.values())
     final_rmse = np.sqrt(sqerror / final_count)
-    results['all'] = {'count': final_count, 'rmse': final_rmse}
+    final_mae = abserror / final_count
+
+    results['all'] = {
+        'count': final_count,
+        'rmse': final_rmse,
+        'mae': final_mae
+    }
     return results
+
+
+def plot_predictions(data, method, dropna=False, *args, **kwargs):
+    """Evaluate a particular baseline method `method` on the next-term
+    prediction task with the given `data`. We assume the `termnum` column is
+    present in the data and make predictions for each term by using all previous
+    terms as training data. Additional argument will be passed to the `method`
+    func.
+
+    """
+    df = pd.DataFrame()
+    evaluator = run_method(data, method, dropna, *args, **kwargs)
+    for termnum, predictions, test in evaluator:
+        if len(predictions) == 0 or len(test) == 0:
+            continue
+
+        p_df = pd.DataFrame({
+            'grdpts': predictions.grdpts.values,
+            'predicted': np.repeat(1, len(predictions.grdpts)),
+            'term': np.repeat(termnum, len(predictions.grdpts))
+        })
+        a_df = pd.DataFrame({
+            'grdpts': test.grdpts.values,
+            'predicted': np.repeat(0, len(test.grdpts)),
+            'term': np.repeat(termnum, len(test.grdpts))
+        })
+        df = pd.concat((df, p_df, a_df))
+
+    def plot(df, max_term, min_term=0):
+        data = df[(df.term <= max_term) & (df.term >= min_term)]
+        grid = sns.FacetGrid(data, row='term',
+                             col='predicted', margin_titles=True, sharey=False)
+        grid.map(plt.hist, 'grdpts')
+        sns.plt.show()
+        x = raw_input("Press ENTER.")
+        return grid
+
+    g1 = plot(df, max_term=7)
+    g2 = plot(df, min_term=8, max_term=14)
+    return df
+
+
+def plot_predictions(results):
+    """Plot the predictions made vs. the actual grades.
+    """
+    results = results.rename(columns={'termnum': 'term'})
+    results = results[['term', 'pred', 'grdpts']].copy()
+
+    results['predicted'] = 1
+    actual = results.copy()
+    actual['predicted'] = 0
+
+    results['grdpts'] = results['pred']
+    del results['pred']
+    del actual['pred']
+
+    data = pd.concat((results, actual))
+
+    def plot(df, max_term, min_term=0):
+        data = df[(df.term <= max_term) & (df.term >= min_term)]
+        grid = sns.FacetGrid(data, row='term', col='predicted',
+                             margin_titles=True, sharey=False)
+        grid.map(plt.hist, 'grdpts')
+        sns.plt.show()
+        return grid
+
+    g1 = plot(data, max_term=7)
+    g2 = plot(data, min_term=8, max_term=14)
+    return g1, g2
+
+
+def _plot_error(error, labels, title="Actual - Predicted", xlabel="Term Number",
+                ylabel="Error"):
+    ax1 = sns.violinplot(error, names=labels, figsize=(12, 6))
+    ax1.set_title(title)
+    ax1.set_xlabel(xlabel)
+    ax1.set_ylabel(ylabel)
+    sns.plt.show()
+
+    ax2 = sns.boxplot(error, names=labels)
+    ax2.set_title(title)
+    ax2.set_xlabel(xlabel)
+    ax2.set_ylabel(ylabel)
+    sns.plt.show()
+
+    return ax1, ax2
+
+
+def plot_error_by(by, results):
+    """Take results from prediction, which should include an error column and
+    plot by the sterm.
+
+    """
+    tups = [(val, results[results[by] == val]['error'].values)
+            for val in np.sort(results[by].unique())]
+    names, errors = zip(*tups)
+    return _plot_error(errors, names, xlabel=by)
+
 
 def quiet_delete(data, col):
     try:
