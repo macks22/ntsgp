@@ -12,7 +12,7 @@ from writer import write_libfm
 from scaffold import *
 
 
-LIBFM = '../libfm-1.42.src/bin/libFM'
+LIBFM = '/home/msweene2/ers-data/libfm-1.42.src/bin/libFM'
 
 
 class LibFMFailed(Exception):
@@ -21,7 +21,8 @@ class LibFMFailed(Exception):
 
 
 def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
-                       outfile='', task='r', bin=LIBFM):
+                       outfile='', task='r', bin=LIBFM, fbias=False,
+                       gbias=False):
     """Put together libFM args in a list suitable for use with Popen.
 
     :param str train:   Path for training data file, in libFM format.
@@ -33,6 +34,12 @@ def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
     :return:            List of args to use for running libFM.
 
     """
+    if bias:
+        fbias, gbias = 1, 1
+    else:
+        fbias = int(fbias)
+        gbias = int(gbias)
+
     bias = int(bias)
     args = [
         bin,
@@ -40,7 +47,7 @@ def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
         '-train', train,
         '-test', test,
         '-iter', str(iter),
-        '-dim', '%d,%d,%d' % (bias, bias, dim),
+        '-dim', '%d,%d,%d' % (gbias, fbias, dim),
         '-init_stdev', str(std)
     ]
     if outfile:
@@ -50,7 +57,7 @@ def compose_libfm_args(train, test, iter=20, std=0.2, dim=8, bias=False,
 
 
 def run_libfm(train, test, iter=20, std=0.2, dim=8, bias=False,
-              outfile='', task='r'):
+              outfile='', task='r', fbias=False, gbias=False):
     """Run libFM and return final train/test results.
 
     :return: Final error for (train, test) sets.
@@ -74,7 +81,7 @@ def run_libfm(train, test, iter=20, std=0.2, dim=8, bias=False,
 
 
 def libfm_predict(train, test, outfile, iter=20, std=0.2, dim=8, bias=False,
-                  task='r'):
+                  task='r', fbias=False, gbias=False):
     """Run libFM, output predictions to file, read file and return predictions
     as an array of floats.
 
@@ -102,8 +109,9 @@ class FM(object):
     """Factorization machine (wraps libFM functionality using subprocess."""
 
     def __init__(self, train, test, outdir='tmp', iter=20, std=0.2, dim=8,
-                 bias=False, task='r', userid='sid', itemid='cid',
-                 target='grdpts', cvals=None, rvals=None, pcgrades=False):
+                 bias=False, fbias=False, gbias=False, task='r', userid='sid',
+                 itemid='cid', target='grdpts', cvals=None, rvals=None,
+                 pcgrades=False):
         """
         :param DataFrame train: Training data.
         :param DataFrame test: Test data.
@@ -141,18 +149,21 @@ class FM(object):
         self.std = std
         self.dim = dim
         self.bias = bias
+        self.gbias = gbias
+        self.fbias = fbias
         self.task = task
 
     def run(self):
         return libfm_predict(self.ftrain, self.ftest, self.outfile, self.iter,
-                             self.std, self.dim, self.bias, self.task)
+                             self.std, self.dim, self.bias, self.task,
+                             self.fbias, self.gbias)
 
 
 def fm_mcmc(train, test, outdir='tmp', iter=20, std=0.2, dim=8, bias=False,
-            task='r', userid='sid', itemid='cid', target='grdpts', cvals=None,
-            rvals=None, pcgrades=False):
-    fm = FM(train, test, outdir, iter, std, dim, bias, task, userid, itemid,
-            target, cvals, rvals, pcgrades)
+            task='r', fbias=False, gbias=False, userid='sid', itemid='cid',
+            target='grdpts', cvals=None, rvals=None, pcgrades=False):
+    fm = FM(train, test, outdir, iter, std, dim, bias, fbias, gbias, task,
+            userid, itemid, target, cvals, rvals, pcgrades)
     return fm.run()
 
 
@@ -228,11 +239,15 @@ def make_parser():
     parser.add_argument(
         'data_file', action='store')
     parser.add_argument(
-        '-v', '--verbose', action='store_true', default=False,
+        '-v', '--verbose', type=int, default=0,
         help='enable verbose logging output')
     parser.add_argument(
         '-b', '--bias', action='store_true', default=False,
         help='bias terms will be used if this flag is given')
+    parser.add_argument(
+        '-fb', '--fbias', action='store_true', default=False)
+    parser.add_argument(
+        '-gb', '--gbias', action='store_true', default=False)
     parser.add_argument(
         '-i', '--iter', type=int, default=200,
         help='number of iterations to run learning algorithm for')
@@ -251,6 +266,10 @@ def make_parser():
     parser.add_argument(
         '-o', '--outdir',
         action='store', default=None)
+    parser.add_argument(
+        '--plot', action='store',
+        choices=('term', 'pred', 'sterm'),
+        default='')
 
     # Add all possible features.
     for featname in CVALS + RVALS:
@@ -265,14 +284,16 @@ if __name__ == "__main__":
     parser = make_parser()
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[%(asctime)s][%(levelname)s]: %(message)s')
+    level = (logging.DEBUG if args.verbose == 2 else
+             logging.INFO if args.verbose == 1 else
+             logging.ERROR)
+    logging.basicConfig(
+        level=level,
+        format='[%(asctime)s][%(levelname)s]: %(message)s')
 
     outdir = args.outdir if args.outdir else gen_ts()
 
-    data = read_data(args.data_file)
+    data = pd.read_csv(args.data_file).sort(['sid', 'termnum'])
 
     cvals = [cval for cval in CVALS if getattr(args, cval)]
     rvals = [rval for rval in RVALS if getattr(args, rval)]
@@ -280,7 +301,18 @@ if __name__ == "__main__":
     def eval_fm(train, test):
         return libfm_model2(
             train, test, outdir=outdir, iter=args.iter, std=args.init_stdev,
-            dim=args.dimension, bias=args.bias, task=args.task, cvals=cvals,
-            rvals=rvals, pcgrades=args.pcgrades)
+            dim=args.dimension, bias=args.bias, fbias=args.fbias,
+            gbias=args.gbias, task=args.task, cvals=cvals, rvals=rvals,
+            pcgrades=args.pcgrades)
 
-    print 'RMSE: %.5f' % eval_method(data, eval_fm, False)['all']['rmse']
+    results = method_error(data, eval_fm, False)
+    evaluation = eval_results(
+        results, by='sterm' if args.plot == 'sterm' else 'termnum')
+    print evaluation
+
+    if args.plot == 'pred':
+        g1, g2 = plot_predictions(results)
+    if args.plot == 'term':
+        ax1, ax2 = plot_error_by('termnum', results)
+    elif args.plot == 'sterm':
+        ax1, ax2 = plot_error_by('sterm', results)
