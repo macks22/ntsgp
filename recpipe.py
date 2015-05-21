@@ -238,7 +238,7 @@ class PreprocessedData(BasicLuigiTask):
     idmap_classes = [IDMAP_TASKS[attr] for attr in cvals]
     idmap_tasks = {klass.__name__: klass() for klass in idmap_classes}
 
-    cvals += ['cohort']
+    cvals += ['cohort', 'sterm']
 
     def requires(self):
         sources = self.data_tasks.copy()
@@ -430,6 +430,14 @@ class PreprocessedData(BasicLuigiTask):
         tmp = tmp.merge(shifted, how='left', right_index=True, left_index=True)
         tmp = tmp[keep]
         data = data.merge(tmp, how='left', on=merge_on)
+
+        # Add student term (sterm).
+        cols = ['sid', 'termnum']
+        tmp = data.drop_duplicates(cols)[cols].sort(cols)
+        tmp['tmp'] = 1
+        tmp['sterm'] = tmp.groupby('sid').transform('cumsum')['tmp']
+        del tmp['tmp']
+        data = data.merge(tmp, how='left', on=cols)
 
         return data
 
