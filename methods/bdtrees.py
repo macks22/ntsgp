@@ -35,4 +35,7 @@ if __name__ == "__main__":
         ensemble.AdaBoostRegressor,
         base_estimator=tree.DecisionTreeRegressor(max_depth=args.max_depth),
         n_estimators=args.n_estimators)
-    print 'RMSE: %.5f' % eval_method(data, clf, True)['all']['rmse']
+
+    result = eval_method(data, clf, True)['all']
+    print 'RMSE: %.5f' % result['rmse']
+    print 'MAE:  %.5f' % result['mae']

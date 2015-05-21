@@ -58,4 +58,7 @@ if __name__ == "__main__":
 
     clf = sklearn_model(
         svm.SVR, **params)
-    print 'RMSE: %.5f' % eval_method(data, clf, True)['all']['rmse']
+
+    result = eval_method(data, clf, True)['all']
+    print 'RMSE: %.5f' % result['rmse']
+    print 'MAE:  %.5f' % result['mae']
