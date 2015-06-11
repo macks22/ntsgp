@@ -92,6 +92,7 @@ class FM(object):
         silent_mkdir(tmpdir)
         if not outdir:
             outdir = gen_ts()
+
         self.outdir = os.path.join(tmpdir, outdir)
         silent_mkdir(self.outdir)
 
