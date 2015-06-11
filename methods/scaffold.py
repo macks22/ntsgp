@@ -1,15 +1,15 @@
 import sys
 import logging
+import argparse
 
 import numpy as np
 import pandas as pd
-from sklearn import preprocessing
+from sklearn import preprocessing, metrics
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 sys.path.append('../')
 sys.path.append('/home/msweene2/ers-data/')
-from recpipe import PreprocessedData
 
 
 def split_xy(data, target='GRADE'):
@@ -40,9 +40,10 @@ def _rmse(predicted, actual):
     actual values. This assumes `predicted` and `actual` are arrays of values to
     compare, they are the same length, and there are no missing values.
     """
-    sqerror = (predicted - actual) ** 2
-    mse = sqerror.sum() / len(sqerror)
-    return np.sqrt(mse)
+    return np.sqrt(((predicted - actual) ** 2).sum() / len(predicted))
+
+def _mae(predicted, actual):
+    return abs((predicted - actual)).sum() / len(predicted)
 
 
 def read_data(fname, usecols=['sid', 'cid', 'grdpts', 'termnum']):
@@ -50,9 +51,6 @@ def read_data(fname, usecols=['sid', 'cid', 'grdpts', 'termnum']):
     logging.info("reading data from: %s" % fname)
 
     # Only read needed columns.
-    task = PreprocessedData()
-    if not usecols:
-        usecols = task.cvals
     features = list(set(task.rvals + usecols))
 
     data = pd.read_csv(fname, usecols=features)
@@ -132,7 +130,10 @@ def run_method(data, method, dropna=False, *args, **kwargs):
 
     for termnum in terms:
         logging.info("making predictions for termnum %d" % termnum)
-        train = data[data['termnum'] < termnum]
+        # train_mask = ((data['termnum'] < termnum) &
+        #               (data['termnum'] > termnum - 5))
+        train_mask = data['termnum'] < termnum
+        train = data[train_mask]
         test = data[data['termnum'] == termnum].copy()
         test = remove_cold_start(train, test)
         if len(test) == 0 or len(train) == 0:
@@ -167,18 +168,70 @@ def eval_results(results, by='termnum'):
         lambda df: np.sqrt((df['error'].values ** 2).sum() / len(df)))
     mae = results.groupby(by).apply(
         lambda df: abs(df['error'].values).sum() / len(df))
+    mae_std = results.groupby(by).apply(
+        lambda df: abs(df['error'].values).std())
     counts = results.groupby(by)['error'].count()
 
     total_count = len(results)
     rmse['all'] = np.sqrt((rmse**2 * counts).sum() / total_count)
     mae['all'] = (mae * counts).sum() / total_count
+    mae_std['all'] = abs(results['error'].values).std()
     counts['all'] = total_count
 
     results = pd.DataFrame()
     results['rmse'] = rmse
     results['mae'] = mae
+    results['mae_std'] = mae_std
     results['counts'] = counts
     return results
+
+
+def df_rmse(df):
+    return (df['error'] ** 2).sum() / len(df)
+
+def df_mae(df):
+    return abs(df['error']).sum() / len(df)
+
+def granular_eval(results, metric=df_rmse, metric_name='RMSE'):
+    """Plot a granular view of the error for a particular result. This takes the
+    form of a heatmap (termnum X sterm) with a barplot on the top and side for
+    by-termnum and by-sterm error.
+    """
+    mat = results.groupby(['termnum', 'sterm']).apply(metric).unstack(1)
+    by_sterm = results.groupby('sterm').apply(metric)
+    by_term = results.groupby('termnum').apply(metric)
+
+    # Set up plot geometry.
+    f = plt.figure(figsize=(9, 9))
+    gs = plt.GridSpec(15, 6)
+    top_hist_ax = f.add_subplot(gs[:5, :4])
+    map_ax = f.add_subplot(gs[5:-2, :4])
+    bar_ax = f.add_subplot(gs[-1, :4])
+    right_hist_ax = f.add_subplot(gs[5:-2, 4:])
+
+    # Plot top histogram (sterm).
+    num_sterms = len(results['sterm'].unique())
+    top_hist_ax.bar(range(num_sterms), by_sterm, 1, ec='w', lw=2, color='.3',
+                    alpha=0.7)
+    top_hist_ax.set(xticks=[], ylabel='%s by Student Term' % metric_name)
+
+    # Plot right histogram (termnum).
+    num_terms = len(results['termnum'].unique())
+    right_hist_ax.barh(range(num_terms), by_term, height=1, ec='w', lw=2,
+                       color='.3', alpha=0.7)
+    right_hist_ax.set(yticks=[], xlabel='%s by Term Number' % metric_name)
+    right_hist_ax.set_ylim(0, num_terms)
+    right_hist_ax.invert_yaxis()
+    right_hist_ax.xaxis.tick_top()
+    right_hist_ax.xaxis.set_label_position('top')
+
+    # Plot heatmap and heat bar.
+    sns.heatmap(mat, cmap='Reds', ax=map_ax, cbar_ax=bar_ax,
+                cbar_kws={'orientation': 'horizontal'})
+    bar_ax.set(xlabel=metric_name)
+
+    sns.plt.show()
+    return f
 
 
 # TODO: DEPRECATE
@@ -218,46 +271,6 @@ def eval_method(data, method, dropna=False, *args, **kwargs):
         'mae': final_mae
     }
     return results
-
-
-def plot_predictions(data, method, dropna=False, *args, **kwargs):
-    """Evaluate a particular baseline method `method` on the next-term
-    prediction task with the given `data`. We assume the `termnum` column is
-    present in the data and make predictions for each term by using all previous
-    terms as training data. Additional argument will be passed to the `method`
-    func.
-
-    """
-    df = pd.DataFrame()
-    evaluator = run_method(data, method, dropna, *args, **kwargs)
-    for termnum, predictions, test in evaluator:
-        if len(predictions) == 0 or len(test) == 0:
-            continue
-
-        p_df = pd.DataFrame({
-            'grdpts': predictions.grdpts.values,
-            'predicted': np.repeat(1, len(predictions.grdpts)),
-            'term': np.repeat(termnum, len(predictions.grdpts))
-        })
-        a_df = pd.DataFrame({
-            'grdpts': test.grdpts.values,
-            'predicted': np.repeat(0, len(test.grdpts)),
-            'term': np.repeat(termnum, len(test.grdpts))
-        })
-        df = pd.concat((df, p_df, a_df))
-
-    def plot(df, max_term, min_term=0):
-        data = df[(df.term <= max_term) & (df.term >= min_term)]
-        grid = sns.FacetGrid(data, row='term',
-                             col='predicted', margin_titles=True, sharey=False)
-        grid.map(plt.hist, 'grdpts')
-        sns.plt.show()
-        x = raw_input("Press ENTER.")
-        return grid
-
-    g1 = plot(df, max_term=7)
-    g2 = plot(df, min_term=8, max_term=14)
-    return df
 
 
 def plot_predictions(results):
@@ -357,3 +370,94 @@ def sklearn_model(model_class, *args, **kwargs):
         return to_predict
 
     return model
+
+
+def base_parser(description=''):
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument(
+        'data_file', action='store')
+    parser.add_argument(
+        '-v', '--verbose', type=int, default=0,
+        help='enable verbose logging output')
+    parser.add_argument(
+        '--plot', action='store',
+        choices=('term', 'pred', 'sterm'),
+        default='')
+    return parser
+
+
+def setup(parser_func):
+    parser = parser_func()
+    args = parser.parse_args()
+
+    level = (logging.DEBUG if args.verbose == 2 else
+             logging.INFO if args.verbose == 1 else
+             logging.ERROR)
+    logging.basicConfig(
+        level=level,
+        format='[%(asctime)s][%(levelname)s]: %(message)s')
+
+    return args
+
+
+def read_some_data(data_file, cvals=['sid', 'cid', 'sterm', 'grdpts']):
+    # All real-valued attributes of interest.
+    rvals = ['termnum', 'cohort', 'age', 'hsgpa', 'sat', 'chrs', 'clevel',
+             'lterm_gpa', 'lterm_cum_gpa', 'total_chrs', 'num_enrolled',
+             'lterm_cgpa', 'lterm_cum_cgpa', 'total_enrolled', 'term_chrs']
+
+    cols = cvals + rvals
+
+    # Read data.
+    data = pd.read_csv(data_file, usecols=cols).sort(['sid', 'termnum'])
+
+    # Missing value imputation.
+    for rval in rvals:
+        data[rval] = data[rval].fillna(data[rval].median())
+
+    # Drop records with NaN values after imputation.
+    logging.info(
+        'Number of records before discarding nan values: %d' % len(data))
+    data = data.dropna()
+    logging.info('Number of records after: %d' % len(data))
+    return data
+
+
+def balance_weights(y):
+    """Compute sample weights such that the class distribution of y becomes
+    balanced. In other words, count the number of each class and weight the
+    instances by (1 / # instances for class) * min(# instances for each class).
+
+    Parameters
+    ----------
+    y : array-like
+        Labels for the samples.
+    Returns
+    -------
+    weights : array-like
+        The sample weights.
+    """
+    y = np.asarray(y)
+    y = np.searchsorted(np.unique(y), y)
+    bins = np.bincount(y)
+
+    weights = 1. / bins.take(y)
+    weights *= bins.min()
+    return weights
+
+
+def print_eval(test, predicted):
+    print '-' * 40
+    print pd.crosstab(test, predicted, rownames=['True'],
+                      colnames=['Predicted'], margins=True)
+    print '-' * 40
+
+    args = (test, predicted)
+    kwargs = dict(labels=[0,1])
+    print 'F1:        %.4f' % metrics.f1_score(*args, **kwargs)
+    print 'Precision: %.4f' % metrics.precision_score(*args, **kwargs)
+    print 'Recall:    %.4f' % metrics.recall_score(*args, **kwargs)
+
+    uniq_labels = len(np.unique(test))
+    if uniq_labels >= 2:
+        print 'ROC AUC:   %.4f' % metrics.roc_auc_score(*args)

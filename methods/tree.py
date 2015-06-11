@@ -24,6 +24,10 @@ def make_parser():
         '-o', '--out-tree',
         type=int, default=14,
         help='output dot file with decision tree learned on this termnum')
+    parser.add_argument(
+        '--plot', action='store',
+        choices=('term', 'pred', 'sterm'),
+        default='')
     return parser
 
 
@@ -31,9 +35,8 @@ if __name__ == "__main__":
     parser = make_parser()
     args = parser.parse_args()
 
-    # Read data.
-    data = read_data(args.data_file)
-    data = data.dropna()
+    tokeep = ['sid', 'cid', 'major', 'sterm', 'grdpts']
+    data = read_some_data(args.data_file, tokeep)
 
     models = {
         'r': {0: tree.DecisionTreeRegressor,
@@ -58,7 +61,18 @@ if __name__ == "__main__":
     params['_value'] = target
     clf = sklearn_model(
         model_class, **params)
-    print 'RMSE: %.5f' % eval_method(data, clf, True)['all']['rmse']
+
+    results = method_error(data, clf, True)
+    evaluation = eval_results(
+        results, by='sterm' if args.plot == 'sterm' else 'termnum')
+    print evaluation
+
+    if args.plot == 'pred':
+        g1, g2 = plot_predictions(results)
+    if args.plot == 'term':
+        ax1, ax2 = plot_error_by('termnum', results)
+    elif args.plot == 'sterm':
+        ax1, ax2 = plot_error_by('sterm', results)
 
     # Write out decision tree.
     if args.out_tree and not args.forest:
@@ -67,7 +81,7 @@ if __name__ == "__main__":
 
         # Learn classifier for last term prediction.
         train_X, train_y, test_X, test_y = train_test_for_term(
-            data, 14, target)
+            data, data.termnum.max(), target)
 
         del params['_value']
         clf = model_class(**params)
