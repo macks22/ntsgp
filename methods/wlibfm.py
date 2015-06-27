@@ -92,7 +92,6 @@ class FM(object):
         silent_mkdir(tmpdir)
         if not outdir:
             outdir = gen_ts()
-
         self.outdir = os.path.join(tmpdir, outdir)
         silent_mkdir(self.outdir)
 
@@ -166,14 +165,19 @@ class FM(object):
         """Note that probabilities are returned for classification."""
         logging.debug(self.cmd)
 
+        logging.info('spawning libFM subprocess')
         proc = sub.Popen(self.cmd, shell=True, stdout=sub.PIPE)
         retcode = proc.wait()
+        logging.info('libFM finished running')
         if retcode:
             raise LibFMFailed("libFM failed to execute.\n%s" % self.cmd)
 
         # read output and return predictions
         with open(self.outfile) as f:
-            return np.array([float(num) for num in f if num])
+            logging.info('reading predictions output by libFM')
+            predictions = np.array([float(num) for num in f if num])
+            logging.info('done reading predictions')
+            return predictions
 
 
 if __name__ == "__main__":
