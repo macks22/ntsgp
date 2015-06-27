@@ -2,8 +2,6 @@ import os
 import subprocess as sub
 import argparse
 import logging
-import datetime
-import time
 
 import numpy as np
 from sklearn import preprocessing
@@ -55,27 +53,6 @@ def libfm_model(train, test, *args, **kwargs):
     return to_predict
 
 
-def gen_ts():
-    ts = time.time()
-    st = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d-%H-%M-%S')
-    return st
-
-
-CVALS = [
-    # Instructor features
-    'itenure', 'irank', 'iclass', 'iid',
-    # Student features
-    'major', 'hs', 'sex', 'zip', 'srace', 'cohort',
-    # Course features
-    'cdisc']
-RVALS = [
-    # Student features
-    'age', 'hsgpa', 'sat', 'lterm_gpa', 'lterm_cum_gpa',
-    # Course features
-    'chrs', 'clevel', 'total_chrs', 'num_enrolled', 'total_enrolled',
-    'lterm_cgpa', 'lterm_cum_cgpa', 'term_chrs']
-
-
 def make_parser():
     parser = base_parser('try out various libFM params to fine-tune')
     parser.add_argument(
@@ -117,7 +94,13 @@ def make_parser():
         '-r2', type=float, default=0.0)
     parser.add_argument(
         '-o', '--outdir',
-        action='store', default=None)
+        action='store', default='')
+
+    parser.add_argument(
+        '-tw', '--train_window',
+        type=int, default=None,
+        help='how many terms to include in train set, starting from test term'
+             '; default is use all prior terms')
 
     # Add all possible features.
     for featname in CVALS + RVALS:
@@ -152,7 +135,7 @@ if __name__ == "__main__":
     cvals = [cval for cval in CVALS if getattr(args, cval)]
     rvals = [rval for rval in RVALS if getattr(args, rval)]
 
-    target = 'grdpts' if args.task == 'r' else 'alevel'
+    target = 'grdpts' if args.task == 'r' else 'pass'
     if not target in data.columns:
         print "cannot perform %s task without target attribute: %s" % (
             'regression' if args.task == 'r' else 'classification', target)
@@ -166,21 +149,26 @@ if __name__ == "__main__":
             gbias=args.gbias, task=args.task, target=target, cvals=cvals,
             rvals=rvals, previous=args.pcgrades)
 
+    # Regression task.
     if args.task == 'r':
         quiet_delete(data, 'alevel')
 
-        results = method_error(data, eval_fm, False)
+        results = method_error(
+            data, eval_fm, dropna=False, predict_cold_start=args.cold_start,
+            train_window=args.train_window)
         evaluation = eval_results(
             results, by='sterm' if args.plot == 'sterm' else 'termnum')
         print evaluation
 
+        if args.cold_start:
+            print eval_results(results, by='cs')
+
         if args.plot == 'pred':
             g1, g2 = plot_predictions(results)
-        if args.plot == 'term':
-            ax1, ax2 = plot_error_by('termnum', results)
-        elif args.plot == 'sterm':
-            ax1, ax2 = plot_error_by('sterm', results)
+        elif args.plot in ['termnum', 'sterm', 'cohort']:
+            ax1, ax2 = plot_error_by(args.plot, results)
 
+    # Classification task.
     else:
         quiet_delete(data, 'grdpts')
 

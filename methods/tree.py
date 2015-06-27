@@ -3,12 +3,27 @@ from sklearn import tree, ensemble
 from scaffold import *
 
 
+def rf_gi(rf, data):
+    dfs = []
+    cols = data.drop('grdpts', axis=1).columns
+    for tnum in np.sort(data.termnum.unique()):
+        train_x, train_y, _, _ = train_test_for_term(
+            data, tnum, 'grdpts')
+        if len(train_x) == 0:
+            continue
+
+        rf = rf.fit(train_x, train_y)
+        dfs.append(
+            pd.DataFrame(zip(cols, rf.feature_importances_))\
+              .rename(columns={0: 'features', 1: 'gi'})\
+              .sort('gi', ascending=False)\
+              .set_index('features')
+        )
+    return dfs
+
+
 def make_parser():
-    parser = argparse.ArgumentParser(
-        description='Run decision tree regression/classification on ers data')
-    parser.add_argument(
-        'data_file', action='store',
-        help='data file')
+    parser = base_parser('Run Random Forest regression on ers data')
     parser.add_argument(
         '-t', '--task', action='store', default='r',
         help='r=regression, c=classification')
@@ -21,22 +36,24 @@ def make_parser():
         type=int, default=4,
         help='max depth to grow the tree to')
     parser.add_argument(
+        '-nj', '--njobs',
+        type=int, default=4)
+    parser.add_argument(
         '-o', '--out-tree',
         type=int, default=14,
         help='output dot file with decision tree learned on this termnum')
-    parser.add_argument(
-        '--plot', action='store',
-        choices=('term', 'pred', 'sterm'),
-        default='')
     return parser
 
 
 if __name__ == "__main__":
-    parser = make_parser()
-    args = parser.parse_args()
+    args = setup(make_parser)
 
-    tokeep = ['sid', 'cid', 'major', 'sterm', 'grdpts']
-    data = read_some_data(args.data_file, tokeep)
+    # Read data.
+    tokeep = \
+        ['grdpts', 'sid', 'cid', 'termnum', 'major', 'sterm', 'cohort', 'cs',
+         'irank', 'itenure', 'iclass']
+    tokeep += RVALS
+    data = pd.read_csv(args.data_file, usecols=tokeep).sort(['sid', 'termnum'])
 
     models = {
         'r': {0: tree.DecisionTreeRegressor,
@@ -46,7 +63,7 @@ if __name__ == "__main__":
     }
 
     model_class = models[args.task][bool(args.forest)]
-    params = {'max_depth': args.max_depth}
+    params = {'max_depth': args.max_depth, 'n_jobs': args.njobs}
     if args.forest:
         params['n_estimators'] = args.forest
 
@@ -62,17 +79,15 @@ if __name__ == "__main__":
     clf = sklearn_model(
         model_class, **params)
 
-    results = method_error(data, clf, True)
-    evaluation = eval_results(
-        results, by='sterm' if args.plot == 'sterm' else 'termnum')
+    results = method_error(data, clf, True, predict_cold_start=args.cold_start)
+    by = args.plot if args.plot else ('cs' if args.cold_start else 'termnum')
+    evaluation = eval_results(results, by=by)
     print evaluation
 
     if args.plot == 'pred':
         g1, g2 = plot_predictions(results)
-    if args.plot == 'term':
-        ax1, ax2 = plot_error_by('termnum', results)
-    elif args.plot == 'sterm':
-        ax1, ax2 = plot_error_by('sterm', results)
+    elif args.plot in ['termnum', 'sterm', 'cohort']:
+        ax1, ax2 = plot_error_by(args.plot, results)
 
     # Write out decision tree.
     if args.out_tree and not args.forest:

@@ -1,6 +1,8 @@
 import sys
+import time
 import logging
 import argparse
+import datetime
 
 import numpy as np
 import pandas as pd
@@ -10,6 +12,27 @@ import seaborn as sns
 
 sys.path.append('../')
 sys.path.append('/home/msweene2/ers-data/')
+
+
+CVALS = [
+    # Instructor features
+    'itenure', 'irank', 'iclass', 'iid',
+    # Student features
+    'major', 'hs', 'sex', 'zip', 'srace', 'cohort', 'sterm', 'alevel',
+    # Course features
+    'cdisc', 'clevel']
+RVALS = [
+    # Student features
+    'age', 'hsgpa', 'sat', 'lterm_gpa', 'lterm_cum_gpa',
+    # Course features
+    'chrs', 'total_chrs', 'num_enrolled', 'total_enrolled',
+    'lterm_cgpa', 'lterm_cum_cgpa', 'term_chrs']
+
+
+def gen_ts():
+    ts = time.time()
+    st = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d-%H-%M-%S')
+    return st
 
 
 def split_xy(data, target='GRADE'):
@@ -24,7 +47,7 @@ def train_test_for_term(data, termnum, target='grdpts', cold_start=True):
     if not cold_start:
         test = remove_cold_start(train, test)
 
-    if len(test) == 0:
+    if len(test) == 0 or len(train) == 0:
         return np.array([]), np.array([]), np.array([]), np.array([])
 
     # Split up predictors/targets.
@@ -71,8 +94,8 @@ def _compute_error(predicted, actual, userid='sid', itemid='cid',
                   value='grdpts', bounds=(0, 4)):
     # Bound predictions.
     low, high = bounds
-    predicted[predicted[value] > high][value] = high
-    predicted[predicted[value] < low][value] = low
+    predicted.loc[predicted[value] > high, value] = high
+    predicted.loc[predicted[value] < low, value] = low
 
     name_x = '%s_x' % value
     name_y = '%s_y' % value
@@ -117,46 +140,93 @@ def remove_cold_start(train, test, userid='sid', itemid='cid'):
     return test
 
 
-def run_method(data, method, dropna=False, *args, **kwargs):
-    """Evaluate a particular baseline method `method` on the next-term
-    prediction task with the given `data`. We assume the `termnum` column is
-    present in the data and make predictions for each term by using all previous
-    terms as training data. Additional argument will be passed to the `method`
-    func.
+def mark_cold_start(data, userid='sid', itemid='cid'):
+    for term in np.sort(data.termnum.unique()):
+        test = data[data.termnum == term]
+        train = data[data.termnum < term]
+        if len(test) == 0 or len(train) == 0:
+            continue
+
+        for key in [userid, itemid]:
+            diff = np.setdiff1d(test[key], train[key])
+            mask = (data[key].isin(diff) & data.termnum == term)
+            data.loc[mask, 'cs'] = True
+
+
+def mark_cold_start_key(data, key):
+    nkey = 'cs_%s' % key
+    data[nkey] = False
+    for term in np.sort(data.termnum.unique()):
+        test = data[data.termnum == term]
+        train = data[data.termnum < term]
+        if len(test) == 0 or len(train) == 0:
+            continue
+
+        diff = np.setdiff1d(test[key], train[key])
+        mask = (data[key].isin(diff) & data.termnum == term)
+        data.loc[mask, nkey] = True
+
+
+def run_method(data, method, dropna=False, predict_cold_start=True,
+               train_window=None, bounds=(0,4)):
+    """Evaluate a particular method `method` on the next-term prediction task
+    with the given `data`. We assume the `termnum` column is present in the data
+    and make predictions for each term by using all previous terms as training
+    data. Additional argument will be passed to the `method` func.
+
+    Methods must take (train, test) as the only args. Other arguments should be
+    wrapped in a closure before passing that closure to this function.
 
     """
-    data = data.dropna() if dropna else data
+    if dropna:
+        for rval in RVALS:
+            data[rval] = data[rval].fillna(data[rval].median())
+        data.dropna()
+
     terms = list(sorted(data['termnum'].unique()))
 
     for termnum in terms:
         logging.info("making predictions for termnum %d" % termnum)
-        # train_mask = ((data['termnum'] < termnum) &
-        #               (data['termnum'] > termnum - 5))
-        train_mask = data['termnum'] < termnum
+        logging.info('splitting data into train/test sets')
+        if train_window:
+            train_mask = ((data['termnum'] < termnum) &
+                          (data['termnum'] >= termnum - train_window))
+        else:
+            train_mask = data['termnum'] < termnum
         train = data[train_mask]
         test = data[data['termnum'] == termnum].copy()
-        test = remove_cold_start(train, test)
+        if not predict_cold_start:
+            test = remove_cold_start(train, test)
         if len(test) == 0 or len(train) == 0:
             yield (termnum, np.array([]), np.array([]))
             continue
 
         to_predict = test.copy()
         to_predict['grdpts'] = np.nan
-        predictions = method(train, to_predict, *args, **kwargs)
+        predictions = method(train, to_predict)
+        # low, high = bounds
+        # predictions.loc[predictions['grdpts'] > high, 'grdpts'] = high
+        # predictions.loc[predictions['grdpts'] < low, 'grdpts'] = low
         yield (termnum, predictions, test)
 
 
-def method_error(data, method, dropna=False, *args, **kwargs):
+def method_error(data, method, dropna=False, predict_cold_start=True,
+                 train_window=None):
     results = pd.DataFrame()
-    evaluator = run_method(data, method, dropna, *args, **kwargs)
+    evaluator = run_method(
+        data, method, dropna, predict_cold_start, train_window)
     for termnum, predictions, test in evaluator:
         if not len(predictions) == 0 and not len(test) == 0:
-            keep_cols= ['sid', 'cid', 'termnum', 'major', 'sterm', 'grdpts']
+            logging.info('predictions made for term %d' % termnum)
+            keep_cols = ['sid', 'cid', 'termnum', 'major', 'sterm', 'cohort',
+                         'grdpts', 'cs']
             df = test[keep_cols].copy()
             df['pred'] = predictions['grdpts']
+            logging.info('computing error for term %d' % termnum)
             df['error'] = _compute_error(predictions, test)
             results = pd.concat((results, df))
 
+    logging.info('done computing error for method')
     return results
 
 
@@ -187,40 +257,60 @@ def eval_results(results, by='termnum'):
 
 
 def df_rmse(df):
-    return (df['error'] ** 2).sum() / len(df)
+    return np.sqrt((df['error'] ** 2).sum() / len(df))
 
 def df_mae(df):
     return abs(df['error']).sum() / len(df)
 
-def granular_eval(results, metric=df_rmse, metric_name='RMSE'):
+def df_len(df):
+    return len(df)
+
+def name_terms(terms, names_file='../data/courses-termnum-names-map.csv'):
+    """Replace term numbers with names for use as labels when plotting."""
+    names = pd.read_csv(names_file, index_col=0).name
+    return [names[tnum] for tnum in map(int, terms)]
+
+def granular_eval(results, yaxis='termnum', xaxis='sterm', metric=df_rmse,
+                  metric_name='RMSE'):
     """Plot a granular view of the error for a particular result. This takes the
-    form of a heatmap (termnum X sterm) with a barplot on the top and side for
-    by-termnum and by-sterm error.
+    form of a heatmap with a barplot on the top and side for the overal axis
+    trends.
     """
-    mat = results.groupby(['termnum', 'sterm']).apply(metric).unstack(1)
-    by_sterm = results.groupby('sterm').apply(metric)
-    by_term = results.groupby('termnum').apply(metric)
+    mat = results.groupby([yaxis, xaxis]).apply(metric).unstack(1)
+    by_xaxis = results.groupby(xaxis).apply(metric)
+    by_yaxis = results.groupby(yaxis).apply(metric)
+
+    # Axis names.
+    def name_axis(label):
+        return ('Student Term' if label == 'sterm' else
+                'Term Number' if label == 'termnum' else
+                'Cohort' if label == 'cohort' else
+                label)
+
+    yaxis_name = name_axis(yaxis)
+    xaxis_name = name_axis(xaxis)
 
     # Set up plot geometry.
     f = plt.figure(figsize=(9, 9))
-    gs = plt.GridSpec(15, 6)
+    gs = plt.GridSpec(16, 6)
     top_hist_ax = f.add_subplot(gs[:5, :4])
-    map_ax = f.add_subplot(gs[5:-2, :4])
+    map_ax = f.add_subplot(gs[5:-3, :4])
     bar_ax = f.add_subplot(gs[-1, :4])
-    right_hist_ax = f.add_subplot(gs[5:-2, 4:])
+    right_hist_ax = f.add_subplot(gs[5:-3, 4:])
 
     # Plot top histogram (sterm).
-    num_sterms = len(results['sterm'].unique())
-    top_hist_ax.bar(range(num_sterms), by_sterm, 1, ec='w', lw=2, color='.3',
-                    alpha=0.7)
-    top_hist_ax.set(xticks=[], ylabel='%s by Student Term' % metric_name)
+    len_xaxis = len(results[xaxis].unique())
+    barplot_params = {'ec': 'w', 'lw': 2, 'color': '.3', 'alpha': 0.7}
+    top_hist_ax.bar(range(len_xaxis), by_xaxis, 1, **barplot_params)
+    top_hist_ax.set(xticks=[], xlim=(0, len_xaxis),
+                    ylabel='%s by %s' % (metric_name, xaxis_name))
 
     # Plot right histogram (termnum).
-    num_terms = len(results['termnum'].unique())
-    right_hist_ax.barh(range(num_terms), by_term, height=1, ec='w', lw=2,
-                       color='.3', alpha=0.7)
-    right_hist_ax.set(yticks=[], xlabel='%s by Term Number' % metric_name)
-    right_hist_ax.set_ylim(0, num_terms)
+    len_yaxis = len(results[yaxis].unique())
+    right_hist_ax.barh(range(len_yaxis), by_yaxis, height=1, **barplot_params)
+    right_hist_ax.set(
+        yticks=[], ylim=(0, len_yaxis),
+        xlabel='%s by %s' % (metric_name, yaxis_name))
     right_hist_ax.invert_yaxis()
     right_hist_ax.xaxis.tick_top()
     right_hist_ax.xaxis.set_label_position('top')
@@ -228,6 +318,14 @@ def granular_eval(results, metric=df_rmse, metric_name='RMSE'):
     # Plot heatmap and heat bar.
     sns.heatmap(mat, cmap='Reds', ax=map_ax, cbar_ax=bar_ax,
                 cbar_kws={'orientation': 'horizontal'})
+    labels = [label.get_text() for label in map_ax.get_yticklabels()]
+    names = name_terms(labels)
+    map_ax.set_yticklabels(names, rotation='horizontal')
+    if xaxis in ['termnum', 'cohort']:
+        labels = [label.get_text() for label in map_ax.get_xticklabels()]
+        names = name_terms(labels)
+        map_ax.set_xticklabels(names, rotation=90)
+    map_ax.set(xlabel=xaxis_name, ylabel=yaxis_name)
     bar_ax.set(xlabel=metric_name)
 
     sns.plt.show()
@@ -293,7 +391,8 @@ def plot_predictions(results):
         data = df[(df.term <= max_term) & (df.term >= min_term)]
         grid = sns.FacetGrid(data, row='term', col='predicted',
                              margin_titles=True, sharey=False)
-        grid.map(plt.hist, 'grdpts')
+        bins = [0.0, 1.0, 1.67, 2.0, 2.33, 2.67, 3.0, 3.33, 3.67, 4.0]
+        grid.map(plt.hist, 'grdpts', bins=bins)
         sns.plt.show()
         return grid
 
@@ -381,8 +480,12 @@ def base_parser(description=''):
         help='enable verbose logging output')
     parser.add_argument(
         '--plot', action='store',
-        choices=('term', 'pred', 'sterm'),
+        choices=('termnum', 'pred', 'sterm', 'cohort'),
         default='')
+    parser.add_argument(
+        '-c', '--cold-start',
+        action='store_true', default=False,
+        help='include cold-start records in the test set; dropped by default')
     return parser
 
 

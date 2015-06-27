@@ -4,11 +4,7 @@ from scaffold import *
 
 
 def make_parser():
-    parser = argparse.ArgumentParser(
-        description='Run decision tree regression/classification on ers data')
-    parser.add_argument(
-        'data_file', action='store',
-        help='data file')
+    parser = base_parser('Run boosted decision tree regression on ers data')
     parser.add_argument(
         '-n', '--n-estimators',
         action='store', type=int, default=10,
@@ -21,14 +17,13 @@ def make_parser():
 
 
 if __name__ == "__main__":
-    parser = make_parser()
-    args = parser.parse_args()
+    args = setup(make_parser)
 
     # Read data.
-    data = read_data(args.data_file)
-    data = data.dropna()
-    if 'GRADE' in data:
-        del data['GRADE']
+    tokeep = \
+        ['grdpts', 'sid', 'cid', 'termnum', 'major', 'sterm', 'cohort', 'cs']
+    tokeep += RVALS
+    data = pd.read_csv(args.data_file, usecols=tokeep).sort(['sid', 'termnum'])
 
     # Build classifier.
     clf = sklearn_model(
@@ -36,6 +31,12 @@ if __name__ == "__main__":
         base_estimator=tree.DecisionTreeRegressor(max_depth=args.max_depth),
         n_estimators=args.n_estimators)
 
-    result = eval_method(data, clf, True)['all']
-    print 'RMSE: %.5f' % result['rmse']
-    print 'MAE:  %.5f' % result['mae']
+    results = method_error(data, clf, True, predict_cold_start=args.cold_start)
+    by = args.plot if args.plot else ('cs' if args.cold_start else 'termnum')
+    evaluation = eval_results(results, by=by)
+    print evaluation
+
+    if args.plot == 'pred':
+        g1, g2 = plot_predictions(results)
+    elif args.plot in ['termnum', 'sterm', 'cohort']:
+        ax1, ax2 = plot_error_by(args.plot, results)

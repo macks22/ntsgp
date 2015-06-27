@@ -45,6 +45,9 @@ def make_parser():
     return parser
 
 
+# TODO: replace use of scipy.optimize.brute with custom multiprocessing grid
+# search function. Lift code from scipy and refine using `multiprocessing`
+# module.
 if __name__ == "__main__":
     args = setup(make_parser)
     data = pd.read_csv(args.data_file).sort(['sid', 'termnum'])
