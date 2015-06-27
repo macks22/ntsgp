@@ -1,8 +1,16 @@
+import os
+import sys
 import time
 import logging
 import warnings
 import argparse
 import datetime
+import multiprocessing as mp
+
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
 
 import numpy as np
 import pandas as pd
@@ -10,8 +18,8 @@ import scipy as sp
 from scipy.sparse import linalg as splinalg
 from sklearn import svm, linear_model, ensemble, tree, neighbors, preprocessing
 
-from scaffold import read_data, rmse, eval_method
-from libfm import libfm_model2
+from scaffold import *
+from libfm import libfm_model, CVALS, RVALS
 
 
 def gen_ts():
@@ -21,9 +29,10 @@ def gen_ts():
 
 def eval_fm(train, test):
     outdir = gen_ts()
-    return libfm_model2(
-        train, test, outdir=outdir, iter=200, std=0.2, dim=8, bias=True,
-        task='r')
+    return libfm_model(
+        train, test, method='mcmc', std=0.2, iter=200, dim=8,
+        fbias=True, gbias=True, task='r', target='grdpts',
+        cvals=None, rvals=None)
 
 
 def uniform_random_baseline(train, test, value='grdpts'):
@@ -72,11 +81,15 @@ def mean_of_means_baseline(train, test, value='grdpts', userid='sid',
     global_mean = train[value].mean()
     user_means = train.groupby(userid)[value].mean()
     item_means = train.groupby(itemid)[value].mean()
+    # user_means = train.groupby(userid).apply(
+    #     lambda df: (df[value] - global_mean).mean())
+    # item_means = train.groupby(itemid).apply(
+    #     lambda df: (df[value] - global_mean).mean())
     to_predict[value] = to_predict.apply(
         lambda s: (
             global_mean +
-            user_means[s[userid]] +
-            item_means[s[itemid]]) / 3,
+            user_means.get(s[userid], 0) +
+            item_means.get(s[itemid], 0)) / 3,
         axis=1)
     return to_predict
 
@@ -239,6 +252,7 @@ def sklearn_model(model_class, *args, **kwargs):
     return model
 
 
+logging.info('setting up scikit-learn model functions')
 decision_tree_baseline = sklearn_model(
     tree.DecisionTreeRegressor, max_depth=4)
 
@@ -246,13 +260,14 @@ linear_regression_baseline = sklearn_model(
     linear_model.LinearRegression)
 
 sgd_regression_baseline = sklearn_model(
-    linear_model.SGDRegressor, n_iter=10, penalty='l1')
+    linear_model.SGDRegressor, n_iter=15, eta0=0.001, penalty='l1')
 
 knn_regression_baseline = sklearn_model(
     neighbors.KNeighborsRegressor, n_neighbors=20)
 
 random_forest_baseline = sklearn_model(
-    ensemble.RandomForestRegressor, n_estimators=100, max_depth=10)
+    ensemble.RandomForestRegressor, n_estimators=100, max_depth=10,
+    n_jobs=4)
 
 boosted_decision_tree_baseline = sklearn_model(
     ensemble.AdaBoostRegressor,
@@ -273,7 +288,31 @@ def make_parser():
         '-v', '--verbose',
         action='store_true', default=False,
         help='enable verbose logging output')
+    parser.add_argument(
+        '-tw', '--train_window',
+        type=int, default=None,
+        help='how many terms to include in train set, starting from test term'
+             '; default is use all prior terms')
+    parser.add_argument(
+        '-c', '--cold-start',
+        action='store_true', default=False,
+        help='include cold-start records in the test set; dropped by default')
+    parser.add_argument(
+        '-n', '--njobs',
+        type=int, default=4)
     return parser
+
+
+# def eval_method(method_name, result_dict, data, method, dropna=False,
+#                 predict_cold_start=False, train_window=None):
+#     results = method_error(
+#         data, method, dropna, predict_cold_start=predict_cold_start,
+#         train_window=train_window)
+#     result_dict[method_name] = eval_results(results, by='termnum')
+#     return method_name
+# 
+# def print_result(method_name):
+#     print '%s:\t%.4f' % (method_name, results[method_name].ix['all']['rmse'])
 
 
 if __name__ == "__main__":
@@ -285,12 +324,18 @@ if __name__ == "__main__":
         level=logging.INFO if args.verbose else logging.CRITICAL)
     warnings.simplefilter(action='ignore', category=FutureWarning)
 
-    data = read_data(args.data_file)
+    random_forest_baseline = sklearn_model(
+        ensemble.RandomForestRegressor, n_estimators=100, max_depth=10,
+        n_jobs=args.njobs)
 
-    # Make predictions using baseline methods.
-    logging.info('making predictions with baseline methods')
-    results = {}  # hold method_name: final_rmse
+    logging.info('reading data from %s' % args.data_file)
+    tokeep = ['grdpts', 'sid', 'cid', 'termnum', 'major', 'sterm', 'cohort',
+              'cs']
+    tokeep += RVALS
+    data = pd.read_csv(args.data_file, usecols=tokeep).sort(['sid', 'termnum'])
+    logging.info('read %d records' % data.shape[0])
 
+    logging.info('making predictions with simple baselines')
     basic_methods = {
         'uniform random': uniform_random_baseline,
         'global mean': global_mean_baseline,
@@ -298,21 +343,51 @@ if __name__ == "__main__":
         'mean of means': mean_of_means_baseline
     }
 
-    def compute_rmse(method, dropna):
-        return eval_method(data, method, dropna)['all']
+    if args.cold_start:
+        logging.info('predicting cold start records')
 
+    results = {}  # hold method_name: final_rmse
     def print_result(method_name):
         result = results[method_name]
-        print '%s RMSE:\t%.4f\tMAE:\t%.4f' % (
-            method_name, result['rmse'], result['mae'])
+
+        print '\t'.join([method_name] +
+                        ['%.4f' % num for num in result.ix['all']])
+        # print '%s:\t%.4f' % (method_name, result.ix['all']['rmse'])
+
+    def evaluate_method(method, dropna=False):
+        results = method_error(
+            data, method, dropna, predict_cold_start=args.cold_start,
+            train_window=args.train_window)
+        by = 'cs' if args.cold_start else 'termnum'
+        return eval_results(results, by=by)
 
     for method_name, func in basic_methods.items():
-        results[method_name] = compute_rmse(func, False)
+        results[method_name] = evaluate_method(func, False)
         print_result(method_name)
 
     for method_name, func in SKLEARN_MODELS.items():
-        results[method_name] = compute_rmse(func, True)
+        results[method_name] = evaluate_method(func, True)
         print_result(method_name)
+
+
+    # pool = mp.Pool(processes=args.njobs)
+    # manager = mp.Manager()
+    # results = manager.dict()
+
+    # for method_name, func in basic_methods.items():
+    #     arglist = [method_name, results, data, func, False, args.cold_start,
+    #                args.train_window]
+    #     thing = pool.apply_async(eval_method, arglist, callback=print_result)
+    #     thing.get()
+
+    # # These functions can't be pickled because they were created at runtime.
+    # for method_name, func in SKLEARN_MODELS.items():
+    #     arglist = [method_name, results, data, func, True, args.cold_start,
+    #                args.train_window]
+    #     thing = pool.apply_async(eval_method, arglist, callback=print_result)
+    #     thing.get()
+
+    # sys.exit()
 
     # Evaluate using SVD for a variety of k values.
     logging.info('making predictions using SVD...')
@@ -320,9 +395,12 @@ if __name__ == "__main__":
     best = (k_start, np.inf)  # best is start with max rmse to start
     for k in range(k_start, 7):
         key = 'svd (k=%d)' % k
-        result = eval_method(data, svd_baseline, k=k)['all']
+        def _svd_baseline(train, test):
+            return svd_baseline(train, test, k=k)
+
+        result = evaluate_method(svd_baseline)
         results[key] = result
-        err = result['rmse']
+        err = result['rmse']['all']
         if err < best[1]:  # new best RMSE from SVD
             best = (k, err)
         print_result(key)
@@ -330,16 +408,26 @@ if __name__ == "__main__":
     # Now use kNN post-processing using best SVD results.
     best_k = best[0]
     key = 'svd-knn (k=%d)' % best_k
-    results[key] = eval_method(data, svd_knn)['all']
+    results[key] = evaluate_method(svd_knn)
     print_result(key)
 
     # Finally, train/evaluate libFM.
-    results['LibFM'] = eval_method(data, eval_fm, False)['all']
-    print_result('LibFM')
+    # _libfm = 'LibFM'
+    # results[_libfm] = evaluate_method(eval_fm)
+    # print_result(_libfm)
+
+    parts = []
+    if args.cold_start:
+        parts.append('c')
+    parts.append(os.path.splitext(os.path.basename(args.data_file))[0])
+    fname = '%s.pickle' % '-'.join(parts)
+    with open(fname, 'w') as f:
+        pickle.dump(results, f)
 
     # Find top results.
-    pairs = results.items()
-    pairs.sort(key=lambda tup: tup[1])
-    print '\nTop 5 methods:'
-    for name, result in pairs[:5]:
-        print '%s\t%.4f\t%.4f' % (name, result['rmse'], result['mae'])
+    all_results = pd.DataFrame({
+        name: df.ix['all'] for (name, df) in results.items()})\
+            .transpose()\
+            .sort('rmse')
+    print '\nAll Methods Sorted From Best to Worst:'
+    print all_results
