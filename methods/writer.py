@@ -1,4 +1,6 @@
 import os
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -63,8 +65,10 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
     cvals = cvals if cvals else []
     cvals.insert(0, itemid)
     cvals.insert(0, userid)
+    cvals = list(set(cvals))
 
     rvals = rvals if rvals else []
+    rvals = list(set(rvals))
     allvals = cvals + rvals
 
     # Sanity check; make sure train/test columns are the same.
@@ -85,6 +89,7 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
             raise KeyError("colname %s not in DataFrame" % colname)
 
     # First, let's update the values for all cvals.
+    logging.info('updating cvals to create contiguous feature vector IDs')
     max_idx = 0
     for cval in cvals:
         train[cval] += max_idx
@@ -95,6 +100,7 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
     # If requested, include ids for previous course grades.
     # This relies on the presence of a 'pcid' key for previous course id.
     if prev_cgrades:
+        logging.info('accumulating previous course grades...')
         alldata = pd.concat((train, test))
         cid_range = alldata.cid.max() - alldata.cid.min()
         ids_between = max_idx - alldata.cid.max()
@@ -102,6 +108,7 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
         alldata['pcid'] = alldata['cid'] + diff
         prior_cgrades = make_prev_crecord_fmter(alldata)
         max_idx += len(alldata.cid.unique()) + 1
+        logging.info('done accumulating previous course grades')
 
     rval_indices = np.arange(len(rvals)) + max_idx
 
@@ -123,9 +130,14 @@ def write_libfm(ftrain, ftest, train, test, target='grdpts', userid='sid',
         return ' '.join(pieces)
 
     # TODO: consider adding chunksize param to reduce memory overhead.
+    logging.info('writing train file')
     lines = train.apply(extract_row, axis=1)
+    # print lines
     ftrain.write('\n'.join(lines))
+
+    logging.info('writing test file')
     lines = test.apply(extract_row, axis=1)
+    # print lines
     ftest.write('\n'.join(lines))
 
 
