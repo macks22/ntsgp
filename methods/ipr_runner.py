@@ -3,6 +3,13 @@ from scaffold import *
 from ipr.ipr import IPR
 
 
+def mkdir_ifnexists(dirname):
+    try:
+        os.mkdir(dirname)
+    except OSError:
+        pass
+
+
 def make_ipr_parser():
     parser = base_parser()
     parser.add_argument(
@@ -53,24 +60,31 @@ if __name__ == "__main__":
     args = setup(make_ipr_parser)
     data = pd.read_csv(args.data_file).sort(['sid', 'termnum'])
 
+    model = IPR(nmodels=args.nmodels,
+                lambda_w=args.lambda_w,
+                lambda_b=args.lambda_b,
+                iters=args.iters,
+                init_std=args.init_std,
+                nonneg=args.nonneg,
+                verbose=args.verbose,
+                lrate=args.lrate,
+                epsilon=args.epsilon)
+
+    abspath = '/home/msweene2/ers-data/methods/ipr-saves'
+    mkdir_ifnexists(abspath)
+
+    basename = os.path.basename(os.path.splitext(args.data_file)[0])
+    top_savedir = os.path.join(abspath, basename)
+    mkdir_ifnexists(top_savedir)
+
+    sub_savedir = os.path.join(top_savedir, model.args_suffix)
+    mkdir_ifnexists(sub_savedir)
+
     def eval_ipr(train, test):
-        model = IPR(k=args.nmodels,
-                    lambda_w=args.lambda_w,
-                    lambda_b=args.lambda_b,
-                    iters=args.iters,
-                    std=args.init_std,
-                    nonneg=args.nonneg,
-                    verbose=args.verbose,
-                    lrate=args.lrate,
-                    epsilon=args.epsilon)
 
-        saved_test = test.copy()
-
+        saved_test = test.copy() # avoid altering orig data in preprocessing
         eids, X, y, test_eids, test_X, test_y, f_indices, nb = \
             model.preprocess(train, test, args.feature_guide)
-
-        print(eids.shape)
-        print(X.shape)
 
         model.fit(X, y, eids, nb)
 
@@ -78,12 +92,8 @@ if __name__ == "__main__":
         termnum = np.unique(test['termnum'])[0]
         name = 'ipr-model-term%d-tr%d-te%d' % (
             termnum, train.shape[0], test.shape[0])
-        savedir = os.path.join('ipr-saves', '-'.join([name, model.args_suffix]))
-
-        try:
-            model.save(savedir)
-        except OSError:
-            pass
+        savedir = os.path.join(sub_savedir, name)
+        mkdir_ifnexists(savedir)
 
         # calculate and save feature importances
         I, I_pprof = model.feature_importance(
@@ -93,7 +103,7 @@ if __name__ == "__main__":
         ipname = os.path.join(savedir, 'imp_pp') + '.csv'
 
         I.to_csv(iname)
-        I_pprof.to_csv(ipname)
+        I_pprof.to_csv(ipname, index=False)
 
         with open(os.path.join(savedir, 'test-count'), 'w') as f:
             f.write('%s' % saved_test.shape[0])
@@ -104,6 +114,7 @@ if __name__ == "__main__":
 
 
     results = method_error(data, eval_ipr, True, predict_cold_start=args.cold_start)
+    results.to_csv('results.csv')
     by = args.plot if args.plot else ('cs' if args.cold_start else 'termnum')
     evaluation = eval_results(results, by=by)
     print evaluation
