@@ -412,6 +412,10 @@ class PandasDataset(Dataset):
             self.dataset[col] = scaler.inverse_transform(self.dataset[col])
             self.scalers[col][1] = False
 
+    def unscale_reals(self):
+        if self.fguide.real_valueds:
+            self.unscale(self.fguide.real_valueds)
+
     def preprocess(self, impute=True):
         """Return preprocessed (X, y, eid) pairs for the train and test sets.
 
@@ -491,4 +495,60 @@ class PandasDataset(Dataset):
             if nreal else encoded_cats
         y = self.dataset[self.fguide.target].values
         return X, y, eids, indices, nents
+
+    # TODO: should a split be the end of the pipeline of pre-processing? In
+    # other words, should we require that everything else is already done by the
+    # time a split happens? Otherwise we'll end up with separated train/test
+    # datasets which cannot be properly pre-processed due to their separation.
+    # You could implement a whole new Dataset class that stores a separate
+    # train/test set and performs all operations with access to both. That
+    # situation seems like a lot of repetition from the normal PandasDataset
+    # though. It will be simpler to require end-of-the-pipe for splits, but
+    # users may also not want to do all that pre-processing. You could also just
+    # make it expected usage in the typical "assume everyone is an adult"
+    # Pythonic way.
+
+    # TODO: You can also define a bunch of more specific splitting methods, such
+    # as comparison-based splits: split_leq(col, val) (less than, equal),
+    # split_leg(col, val) (less than or equal, greater than). There are 6
+    # comparison options (l, g, eq, le, ge, ne) and it doesn't make sense to
+    # have both train/test be the same so it would be 6 options followed by 5.
+    # However, some don't make sense, such as (le, eq), since the test set would
+    # then be a subset of the train set. This approach would provide some
+    # convenient methods and may not be much more code if you can pass ops as
+    # parameters.
+
+    # TODO: Another consideration is how will this splitter be used by the
+    # trian/predict loop runner method? Perhaps you should write that one first.
+    # It seems the field and the comparisons will be specified and you'll want
+    # to loop based on that. For instance, "time" is specified and <, == are the
+    # comparisons. So loop over every distinct value in the "time" column and
+    # perform the given comparisons to get the train and test sets. At that
+    # point, it's quite easy to just use masks instead of the individual methods
+    # with the _{specifier} names.
+
+    # However, since preprocess returns numpy variables exits from the Dataset
+    # format to the numpy variables and dicts of metadata, you'll need to make
+    # some changes to accomodate splits based on the preprocessed results. For
+    # instance, you may need to split the results of preprocessing rather than
+    # splitting the DataFrame itself.
+
+    # ONE SOLUTION: define a new subclass that deals with X as a sparse matrix
+    # and y as a numpy array with metadata to work with them.
+
+    def split(self, train_mask, test_mask):
+        """Split the dataset based on a row-wise mask. This allows users to
+        perform comparisons with fields of the DataFrame in the function call,
+        like so:
+
+        dset = PandasDataset(...)
+        train, test = dset.split(dset.dataset.time < 2, dset.dataset.time == 2)
+
+        """
+        return self.dataset[train_mask], self.dataset[test_mask]
+
+    def split_loop(self, col, train_cmp, test_cmp):
+        column = self.dataset[col]
+        for val in column.unique():
+            yield self.split(train_cmp(column, val), test_cmp(column, val))
 
