@@ -17,15 +17,6 @@ from sklearn import preprocessing
 from oset import OrderedSet
 
 
-# Error codes
-BOUNDS_FORMAT = 1000
-MISSING_ATTRIBUTE = 1001
-DIM_MISMATCH = 1002
-BAD_FEATURE_CONF = 1003
-BAD_FILENAME = 1004
-BAD_CMDLINE_ARG = 1005
-
-
 class BadFeatureConfig(Exception):
     """Raise when bad feature configuration file is found."""
     pass
@@ -421,7 +412,6 @@ class PandasDataset(Dataset):
             self.dataset[col] = scaler.inverse_transform(self.dataset[col])
             self.scalers[col][1] = False
 
-    # TODO: Incorporate preprocess as a method.
     def preprocess(self, impute=True):
         """Return preprocessed (X, y, eid) pairs for the train and test sets.
 
@@ -502,115 +492,3 @@ class PandasDataset(Dataset):
         y = self.dataset[self.fguide.target].values
         return X, y, eids, indices, nents
 
-    # TODO: Take the code from scaffold.py and incorporate. This includes logic
-    # for splitting the train and test data. This logic is somewhat general --
-    # splitting a dataset based on a time attribute, so you can write it more
-    # generally in that line of thinking. You can make it even more general:
-    # splitting based on a binary comparison relationship with one of the
-    # columns. You could also have a method which builds on the simple split to
-    # perform sequential splits based on all unique values of a column, applying
-    # one comparison to get the train set and another to get the test set.
-
-
-def read_train_test(train_file, test_file, conf_file):
-    """Read the train and test data according to the feature guide in the
-    configuration file. Return the train and test data as (X, y) pairs for the
-    train and test data.
-
-    Args:
-        train_file (str): Path of the CSV train data file.
-        test_file (str): Path of the CSV test data file.
-        conf_file (str): Path of the configuration file.
-
-    Returns:
-        tuple: (train_eids, train_X, train_y,
-                test_eids, test_X, test_y,
-                feat_indices, number_of_entities),
-               preprocessed train/test data and mappings from features to
-               indices in the resulting data matrices. Both train and test are
-               accompanied by 0-contiguous primary entity id arrays.
-
-    """
-    try:
-        target, ents, cats, reals = read_feature_guide(conf_file)
-    except IOError:
-        raise IOError('invalid feature guide conf file path: %s' % conf_file)
-
-    to_read = [target] + ents + cats + reals
-    def read_file(name, fpath):
-        try:
-            data = pd.read_csv(fpath, usecols=to_read)
-        except IOError:
-            raise IOError('invalid %s file path: %s' % (name, fpath))
-        except ValueError as err:
-            attr_name = err.args[0].split("'")[1]
-            attr_type = ('entity' if attr_name in ents else
-                         'categorical' if attr_name in cats else
-                         'real-valued' if attr_name in reals else
-                         'target')
-            raise BadFeatureConfig('%s attribute %s not found in %s file' % (
-                attr_type, attr_name, name))
-
-        return data
-
-    train = read_file('train', train_file)
-    test = read_file('test', test_file)
-    n_train = train.shape[0]
-    n_test = test.shape[0]
-    logging.info('number of instances: train=%d, test=%d' % (
-        train.shape[0], test.shape[0]))
-
-    return train, test, target, ents, cats, reals
-
-
-class Model(object):
-    """General model class with load/save/preprocess functionality."""
-
-    def set_fguide(self, fguidef=''):
-        if fguidef:
-            self.read_fguide(fguidef)
-        else:
-            self.reset_fguide()
-
-    def read_fguide(self, fguidef):
-        self.target, self.ents, self.cats, self.reals = \
-            read_feature_guide(fguidef)
-
-    def reset_fguide(self):
-        self.target = ''
-        for name in ['ents', 'cats', 'reals']:
-            setattr(self, name, [])
-
-    @property
-    def fgroups(self):
-        return ('ents', 'cats', 'reals')
-
-    @property
-    def nf(self):
-        return sum(len(group) for group in self.fgroups)
-
-    def check_fguide(self):
-        if self.nf <= 0:
-            raise ValueError("preprocessing requires feature guide")
-
-    def read_necessary_fguide(self, fguide=''):
-        if fguide:
-            self.read_fguide(fguide)
-        else:
-            self.check_fguide()
-
-    def preprocess(self, train, test, fguidef=''):
-        self.read_necessary_fguide(fguidef)
-        return preprocess(
-            train, test, self.target, self.ents, self.cats, self.reals)
-
-    def check_if_learned(self):
-        unlearned = [attr for attr, val in self.model.items() if val is None]
-        if len(unlearned) > 0 or len(self.model) == 0:
-            raise UnlearnedModel("IPR predict with unlearned params", unlearned)
-
-    def save(self, savedir, ow=False):
-        save_model_vars(self.model, savedir, ow)
-
-    def load(self, savedir):
-        self.model = load_model_vars(savedir)
