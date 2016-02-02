@@ -373,8 +373,8 @@ class PandasFullDataset(PandasDataset):
             # Store fill_value imputed.
             self.imputations[col] = fill_value
 
-    def impute_reals(self):
-        self.impute(self.fguide.real_valueds)
+    def impute_reals(self, **kwargs):
+        self.impute(self.fguide.real_valueds, **kwargs)
 
     def scale(self, columns):
         """Z-score scale the given columns IN-PLACE, storing the scalers used in
@@ -423,7 +423,8 @@ class PandasFullDataset(PandasDataset):
                 logging.info("column '%s' has not been scaled, ignoring" % col)
                 continue
 
-            self.dataset[col] = scaler.inverse_transform(self.dataset[col])
+            self.dataset.loc[:, col] = \
+                scaler.inverse_transform(self.dataset[col])
             self.scalers[col][1] = False
 
     def unscale_reals(self):
@@ -510,46 +511,6 @@ class PandasFullDataset(PandasDataset):
         y = self.dataset[self.fguide.target].values
         return X.tocsr(), y, eids, indices, nents
 
-    # TODO: should a split be the end of the pipeline of pre-processing? In
-    # other words, should we require that everything else is already done by the
-    # time a split happens? Otherwise we'll end up with separated train/test
-    # datasets which cannot be properly pre-processed due to their separation.
-    # You could implement a whole new Dataset class that stores a separate
-    # train/test set and performs all operations with access to both. That
-    # situation seems like a lot of repetition from the normal PandasDataset
-    # though. It will be simpler to require end-of-the-pipe for splits, but
-    # users may also not want to do all that pre-processing. You could also just
-    # make it expected usage in the typical "assume everyone is an adult"
-    # Pythonic way.
-
-    # TODO: You can also define a bunch of more specific splitting methods, such
-    # as comparison-based splits: split_leq(col, val) (less than, equal),
-    # split_leg(col, val) (less than or equal, greater than). There are 6
-    # comparison options (l, g, eq, le, ge, ne) and it doesn't make sense to
-    # have both train/test be the same so it would be 6 options followed by 5.
-    # However, some don't make sense, such as (le, eq), since the test set would
-    # then be a subset of the train set. This approach would provide some
-    # convenient methods and may not be much more code if you can pass ops as
-    # parameters.
-
-    # TODO: Another consideration is how will this splitter be used by the
-    # trian/predict loop runner method? Perhaps you should write that one first.
-    # It seems the field and the comparisons will be specified and you'll want
-    # to loop based on that. For instance, "time" is specified and <, == are the
-    # comparisons. So loop over every distinct value in the "time" column and
-    # perform the given comparisons to get the train and test sets. At that
-    # point, it's quite easy to just use masks instead of the individual methods
-    # with the _{specifier} names.
-
-    # However, since preprocess exits from the Dataset format to the numpy
-    # variables and dicts of metadata, you'll need to make some changes to
-    # accomodate splits based on the preprocessed results. For instance, you may
-    # need to split the results of preprocessing rather than splitting the
-    # DataFrame itself.
-
-    # ONE SOLUTION: define a new subclass that deals with X as a sparse matrix
-    # and y as a numpy array with metadata to work with them.
-
     def split(self, train_mask, test_mask):
         """Split the dataset based on a row-wise mask. This allows users to
         perform comparisons with fields of the DataFrame in the function call,
@@ -559,28 +520,14 @@ class PandasFullDataset(PandasDataset):
         train, test = dset.split(dset.dataset.time < 2, dset.dataset.time == 2)
 
         """
-        train_idx = np.nonzero(train_mask)[0]
-        test_idx = np.nonzero(test_mask)[0]
-
         train = self.dataset[train_mask]
         test = self.dataset[test_mask]
-        both = pd.concat((train, test))
-        return train, test
+        return PandasTrainTestSplit(train, test, self.fguide)
 
     def split_loop(self, col, train_cmp, test_cmp):
         column = self.dataset[col]
         for val in column.unique():
             yield self.split(train_cmp(column, val), test_cmp(column, val))
-
-    # TODO: we could use a numpy fancy index to split the sparse matrix X and
-    # the numpy array y along with the eids for all entities. However, we still
-    # have the problem of data leakage in preprocessing. During imputation, we
-    # cannot use the data in the test set to calculate fill values. This
-    # requires us to be able to perform preprocessing on the train set and save
-    # the scalers/encoders/etc. However, if we want to one-hot encode, we need
-    # access to the test set as well so we can consider all IDs during encoding.
-    # So what we need here for a complete solution is a class which deals with
-    # two separate DataFrames -- one for the train set and one for the test set.
 
 
 class PandasTrainTestSplit(PandasDataset):
@@ -603,7 +550,7 @@ class PandasTrainTestSplit(PandasDataset):
         return dset
 
     @classmethod
-    def from_dfs(cls, train_df, test_df, fguide, inplace=True):
+    def from_dfs(cls, train_df, test_df, fguide):
         """Initialize a dataset from DataFrame objects and a FeatureGuide
         already in memory.
         """
@@ -612,13 +559,11 @@ class PandasTrainTestSplit(PandasDataset):
         index_col = cls.index_from_feature_guide(fguide)
 
         if index_col is None:
-            train = train_df.reset_index(inplace=inplace)\
-                            .drop('index', axis=1)[usecols]
-            test = test_df.reset_index(inplace=inplace)\
-                          .drop('index', axis=1)[usecols]
+            train = train_df.reset_index(drop=True)[usecols]
+            test = test_df.reset_index(drop=True)[usecols]
         else:
-            train = train_df.set_index(index_col, inplace=inplace)[usecols]
-            test = test_df.set_index(index_col, inplace=inplace)[usecols]
+            train = train_df.set_index(index_col)[usecols]
+            test = test_df.set_index(index_col)[usecols]
 
         return cls(train, test, fguide)
 
@@ -632,7 +577,6 @@ class PandasTrainTestSplit(PandasDataset):
         self.imputations = {}  # imputing missing values
         self.scalers = {}      # scaling column values
 
-    # TODO: update all methods after this line for the train/test split.
     def map_column_to_index(self, col):
         """Map values in column to a 0-contiguous index. This enables use of
         these attributes as indices into an array (for bias terms, for
@@ -643,19 +587,21 @@ class PandasTrainTestSplit(PandasDataset):
             key (str): Column name with ids to map.
         """
         # First construct the map from original ids to new ones.
-        ids = self.dataset[col].unique()
+        ids = pd.concat((self.train[col], self.test[col])).unique()
         n = len(ids)
         idmap = dict(itertools.izip(ids, xrange(n)))
 
-        # Next use the map to conver the ids in-place.
-        self.dataset[col] = self.dataset[col].apply(lambda _id: idmap[_id])
+        # Next use the map to convert the ids in-place.
+        self.train.loc[:, col] = self.train[col].apply(lambda _id: idmap[_id])
+        self.test.loc[:, col] = self.test[col].apply(lambda _id: idmap[_id])
 
         # Now swap key for value in the idmap to provide a way to convert back.
         self.column_maps[col] = {val: key for key, val in idmap.iteritems()}
 
     def remove_feature(self, name):
         """Remove the given feature from the feature guide and then from the
-        dataset.
+        dataset. The feature is removed from both train and test DataFrame
+        objects in-place.
 
         Args:
             name (str): Name of the feature to remove.
@@ -665,16 +611,26 @@ class PandasTrainTestSplit(PandasDataset):
             KeyError: if the name is not in feature guide or not in the dataset.
         """
         self.fguide.remove(name)
-        self.dataset = self.dataset.drop(name, axis=1)
+        self.train.loc[:] = self.train.drop(name, axis=1)
+        self.test.loc[:] = self.test.drop(name, axis=1)
 
-    def column_is_all_null(self, column):
-        return self.dataset[column].isnull().sum() == len(self.dataset)
+    @staticmethod
+    def df_column_is_all_null(df, column):
+        """Return True if the given column has only NaN values, else False."""
+        return df[column].isnull().sum() == len(df)
+
+    def train_column_is_all_null(self, column):
+        """Return True if the given column has only NaN values in the training
+        set, else False.
+        """
+        return self.df_column_is_all_null(self.train, column)
 
     def verify_columns_in_dataset(self, columns):
         """Ensure all columns are present in the dataset before doing some
-        operation to avoid side effects or the need for rollback.
+        operation to avoid side effects or the need for rollback. We assume here
+        that both train and test DataFrame objects share the same column set.
         """
-        all_cols = self.dataset.columns
+        all_cols = self.train.columns
         for col in columns:
             if not col in all_cols:
                 raise KeyError("column '%s' not in dataset" % col)
@@ -683,6 +639,10 @@ class PandasTrainTestSplit(PandasDataset):
         """Perform missing value imputation for the given columns using the
         specified `pandas.DataFrame` method for the fill value. All NaN values
         in the columns will be replaced with this value.
+
+        In order to avoid data leakage, the fill value is computed from the
+        training set and used to fill in missing values in both the train and
+        test sets.
 
         Args:
             columns (iterable of str): Column names to perform missing value
@@ -710,11 +670,11 @@ class PandasTrainTestSplit(PandasDataset):
         # If all_null='raise', check all columns first to avoid side effects.
         if all_null == 'raise':
             for col in columns:
-                if self.column_is_all_null(col):
+                if self.train_column_is_all_null(col):
                     raise ValueError("all null column '%s'" % col)
 
         for col in columns:
-            if self.column_is_all_null(col):
+            if self.train_column_is_all_null(col):
                 if all_null == 'drop':
                     self.remove_feature(col)
                     logging.info("all null column '%s' was dropped" % col)
@@ -724,20 +684,24 @@ class PandasTrainTestSplit(PandasDataset):
                     logging.info("all null column '%s' ignored" % col)
 
             # Compute fill value and fill all NaN values.
-            column = self.dataset[col]
-            fill_value = getattr(column, method)()
-            self.dataset[col] = column.fillna(fill_value)
+            train_column = self.train[col]
+            fill_value = getattr(train_column, method)()
+            self.train.loc[:, col] = train_column.fillna(fill_value)
+            self.test.loc[:, col] = self.test[col].fillna(fill_value)
 
             # Store fill_value imputed.
             self.imputations[col] = fill_value
 
-    def impute_reals(self):
-        self.impute(self.fguide.real_valueds)
+    def impute_reals(self, **kwargs):
+        self.impute(self.fguide.real_valueds, **kwargs)
 
     def scale(self, columns):
         """Z-score scale the given columns IN-PLACE, storing the scalers used in
         the `scalers` instance variable. The scaling can be reversed using
         `unscale`.
+
+        In order to avoid data leakage, the scaling parameters are computed from
+        the training set and used to scale both the train and the test sets.
 
         Args:
             columns (iterable of str): Column names to scale.
@@ -757,7 +721,8 @@ class PandasTrainTestSplit(PandasDataset):
 
             if not scaled:
                 self.scalers[col] = (scaler, True)
-                self.dataset[col] = scaler.fit_transform(self.dataset[col])
+                self.train.loc[:, col] = scaler.fit_transform(self.train[col])
+                self.test.loc[:, col] = scaler.transform(self.test[col])
 
     def scale_reals(self):
         if self.fguide.real_valueds:
@@ -781,14 +746,15 @@ class PandasTrainTestSplit(PandasDataset):
                 logging.info("column '%s' has not been scaled, ignoring" % col)
                 continue
 
-            self.dataset[col] = scaler.inverse_transform(self.dataset[col])
-            self.scalers[col][1] = False
+            self.train.loc[:, col] = scaler.inverse_transform(self.train[col])
+            self.test.loc[:, col] = scaler.inverse_transform(self.test[col])
+            self.scalers[col][1] = False  # mark not scaled
 
     def unscale_reals(self):
         if self.fguide.real_valueds:
             self.unscale(self.fguide.real_valueds)
 
-    def preprocess(self, impute=True):
+    def preprocess(self, impute=True, all_null='raise'):
         """Return preprocessed (X, y, eid) pairs for the train and test sets.
 
         Preprocessing includes:
@@ -798,30 +764,43 @@ class PandasTrainTestSplit(PandasDataset):
         3.  One-hot encode the categorical features (including entity IDs).
 
         This function tries to be as general as possible to accomodate learning by
-        many models. As such, there are a variety of return values:
+        many models. As such, there are a variety of return values (8 in total).
+        The first three are for the train set:
 
         1.  X: feature vector matrix (first categorical, then real-valued)
         2.  y: target values (unchanged from input)
         3.  eids: entity IDs as a numpy ndarray
-        4.  indices: The indices of each feature in the encoded X matrix.
-        5.  nents: The number of unique entities for each entity.
+
+        The next 3 return values are the same except for the test set. The final
+        two values are:
+
+        7.  indices: The indices of each feature in the encoded X matrix.
+        8.  nents: The number of unique entities for each entity.
 
         """
-        eids = {}
+        train_eids = {}
+        test_eids = {}
         for entity in self.fguide.entities:
             self.map_column_to_index(entity)
-            eids[entity] = self.dataset[entity].values
+            train_eids[entity] = self.train[entity].values
+            test_eids[entity] = self.test[entity].values
 
         # Z-score scaling of real-valued features.
-        self.impute_reals()
+        self.impute_reals(all_null=all_null)
         self.scale_reals()
         nreal = len(self.fguide.real_valueds)
 
         # One-hot encoding of entity and categorical features.
         cats_and_ents = list(self.fguide.entities | self.fguide.categoricals)
-        all_cats = self.dataset[cats_and_ents]
+        all_cats = pd.concat((self.train[cats_and_ents],
+                              self.test[cats_and_ents]))
         encoder = preprocessing.OneHotEncoder()
         encoded_cats = encoder.fit_transform(all_cats)
+
+        # Split apart train and test set arrays after one-hot encoding.
+        nd_train = self.train.shape[0]
+        train_enc_cats = encoded_cats[:nd_train]
+        test_enc_cats = encoded_cats[nd_train:]
 
         # Create a feature map for decoding one-hot encoding.
         ncats_and_ents = encoder.active_features_.shape[0]
@@ -863,79 +842,38 @@ class PandasTrainTestSplit(PandasDataset):
         logging.info('Total of %d features after encoding' % nf)
 
         # Put all features together.
-        X = sp.sparse.hstack((encoded_cats, self.reals))\
-            if nreal else encoded_cats
-        y = self.dataset[self.fguide.target].values
-        return X.tocsr(), y, eids, indices, nents
+        train_X = sp.sparse.hstack((
+            train_enc_cats, self.train_reals.values))
+        test_X = sp.sparse.hstack((
+            test_enc_cats, self.test_reals.values))
 
-    # TODO: should a split be the end of the pipeline of pre-processing? In
-    # other words, should we require that everything else is already done by the
-    # time a split happens? Otherwise we'll end up with separated train/test
-    # datasets which cannot be properly pre-processed due to their separation.
-    # You could implement a whole new Dataset class that stores a separate
-    # train/test set and performs all operations with access to both. That
-    # situation seems like a lot of repetition from the normal PandasDataset
-    # though. It will be simpler to require end-of-the-pipe for splits, but
-    # users may also not want to do all that pre-processing. You could also just
-    # make it expected usage in the typical "assume everyone is an adult"
-    # Pythonic way.
+        train_y = self.train_target.values
+        test_y = self.test_target.values
 
-    # TODO: You can also define a bunch of more specific splitting methods, such
-    # as comparison-based splits: split_leq(col, val) (less than, equal),
-    # split_leg(col, val) (less than or equal, greater than). There are 6
-    # comparison options (l, g, eq, le, ge, ne) and it doesn't make sense to
-    # have both train/test be the same so it would be 6 options followed by 5.
-    # However, some don't make sense, such as (le, eq), since the test set would
-    # then be a subset of the train set. This approach would provide some
-    # convenient methods and may not be much more code if you can pass ops as
-    # parameters.
+        return (train_X.tocsr(), train_y, train_eids,
+                test_X.tocsr(), test_y, test_eids,
+                indices, nents)
 
-    # TODO: Another consideration is how will this splitter be used by the
-    # trian/predict loop runner method? Perhaps you should write that one first.
-    # It seems the field and the comparisons will be specified and you'll want
-    # to loop based on that. For instance, "time" is specified and <, == are the
-    # comparisons. So loop over every distinct value in the "time" column and
-    # perform the given comparisons to get the train and test sets. At that
-    # point, it's quite easy to just use masks instead of the individual methods
-    # with the _{specifier} names.
 
-    # However, since preprocess exits from the Dataset format to the numpy
-    # variables and dicts of metadata, you'll need to make some changes to
-    # accomodate splits based on the preprocessed results. For instance, you may
-    # need to split the results of preprocessing rather than splitting the
-    # DataFrame itself.
+# Add properties to PandasTrainTestSplit for quick feature section access.
+def set_prop(dset_name, name, section):
+    def get_section(self):
+        dset = getattr(self, dset_name)
+        names = getattr(self.fguide, section)
+        if isinstance(names, basestring):
+            return dset[[names]]
+        else:
+            return dset[list(names)]
 
-    # ONE SOLUTION: define a new subclass that deals with X as a sparse matrix
-    # and y as a numpy array with metadata to work with them.
+    setattr(PandasTrainTestSplit, '%s_%s' % (dset_name, name),
+            property(get_section))
 
-    def split(self, train_mask, test_mask):
-        """Split the dataset based on a row-wise mask. This allows users to
-        perform comparisons with fields of the DataFrame in the function call,
-        like so:
+for dset_name in ['train', 'test']:
+    for name, section in [
+            ('reals', 'real_valueds'),
+            ('categoricals', 'categoricals'),
+            ('entities', 'entities'),
+            ('key', 'key'),
+            ('target', 'target')]:
 
-        dset = PandasDataset(...)
-        train, test = dset.split(dset.dataset.time < 2, dset.dataset.time == 2)
-
-        """
-        train_idx = np.nonzero(train_mask)[0]
-        test_idx = np.nonzero(test_mask)[0]
-
-        train = self.dataset[train_mask]
-        test = self.dataset[test_mask]
-        both = pd.concat((train, test))
-        return train, test
-
-    def split_loop(self, col, train_cmp, test_cmp):
-        column = self.dataset[col]
-        for val in column.unique():
-            yield self.split(train_cmp(column, val), test_cmp(column, val))
-
-    # TODO: we could use a numpy fancy index to split the sparse matrix X and
-    # the numpy array y along with the eids for all entities. However, we still
-    # have the problem of data leakage in preprocessing. During imputation, we
-    # cannot use the data in the test set to calculate fill values. This
-    # requires us to be able to perform preprocessing on the train set and save
-    # the scalers/encoders/etc. However, if we want to one-hot encode, we need
-    # access to the test set as well so we can consider all IDs during encoding.
-    # So what we need here for a complete solution is a class which deals with
-    # two separate DataFrames -- one for the train set and one for the test set.
+        set_prop(dset_name, name, section)
