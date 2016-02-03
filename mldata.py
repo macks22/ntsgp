@@ -990,28 +990,6 @@ class SklearnModel(Model):
         """Positional arguments to model `predict` method."""
         return self.func_pargs(self.model.predict)
 
-    @property
-    def model_params(self):
-        """Return model params learned during fitting."""
-        params = [attr for attr in dir(self.model)
-                  if not attr.endswith('__') and attr.endswith('_')]
-
-        # In older versions of sklearn, some parameters ending in "_" (learned
-        # during model fitting) were set in __init__ or declared as properties.
-        # These were deprecated in v0.17 and will be removed in v0.19. However,
-        # we still look for them here.
-        to_remove = []
-        for attr in params:
-            try:
-                getattr(self.model, attr)
-            except AttributeError:
-                to_remove.append(attr)
-
-        for attr in to_remove:
-            params.remove(attr)
-
-        return params
-
 
 class SklearnRegressionModel(SklearnModel):
 
@@ -1021,19 +999,22 @@ class SklearnRegressionModel(SklearnModel):
         test_X, test_y, test_eids, indices, nents = \
             split.preprocess(all_null='drop')
 
+        # Create copy of model with same params.
+        model = self.model.__class__(**self.model.get_params())
+
         # Pass in only keyword arguments the model actually needs for fitting.
         # This is accomplished via function argspec inspection.
         all_kwargs = {'entity_ids': train_eids,
                       'feature_indices': indices,
                       'n_entities': nents}
         kwargs = {k: v for k, v in all_kwargs.items() if k in self.fit_kwargs}
-        self.model.fit(train_X, train_y, **kwargs)
+        model.fit(train_X, train_y, **kwargs)
 
         # Make predictions using the learned model.
         kwargs = {k: v for k, v in all_kwargs.items()
                   if k in self.predict_kwargs}
-        pred_y = self.model.predict(test_X, **kwargs)
-        return RegressionResults(pred_y, split.test, split.fguide)
+        pred_y = model.predict(test_X, **kwargs)
+        return RegressionResults(pred_y, split.test, split.fguide, model)
 
     def fit_predict_all(self, n_jobs=1):
         """Run sequential fit/predict loop for all possible data splits in a
@@ -1052,11 +1033,12 @@ class SklearnRegressionModel(SklearnModel):
 class Results(object):
     """Encapsulate model prediction results & metadata for evaluation."""
 
-    def __init__(self, predicted, test_data, fguide):
+    def __init__(self, predicted, test_data, fguide, model):
         self.fguide = fguide
         self.pred_colname = '%s_predicted' % fguide.target
         self.test_data = test_data
-        self.test_data[self.pred_colname] = predicted
+        self.test_data.loc[:, self.pred_colname] = predicted
+        self.model = model
 
     @property
     def predicted(self):
@@ -1066,8 +1048,15 @@ class Results(object):
     def actual(self):
         return self.test_data[self.fguide.target]
 
+    @property
+    def model_params(self):
+        """Return model params learned during fitting."""
+        params = [attr for attr in dir(self.model)
+                  if not attr.endswith('__') and attr.endswith('_')]
+        return {param: getattr(self.model, param) for param in params}
 
-class RegressionResults(Results)
+
+class RegressionResults(Results):
     """Encapsulate model regression predictions & metadata for evaluation."""
 
     def error(self):
