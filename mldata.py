@@ -309,7 +309,7 @@ class PandasFullDataset(PandasDataset):
             KeyError: if the name is not in feature guide or not in the dataset.
         """
         self.fguide.remove(name)
-        self.dataset = self.dataset.drop(name, axis=1)
+        self.dataset.pop(name)
 
     def column_is_all_null(self, column):
         return self.dataset[column].isnull().sum() == len(self.dataset)
@@ -665,8 +665,8 @@ class PandasTrainTestSplit(PandasDataset):
             KeyError: if the name is not in feature guide or not in the dataset.
         """
         self.fguide.remove(name)
-        self.train.loc[:] = self.train.drop(name, axis=1)
-        self.test.loc[:] = self.test.drop(name, axis=1)
+        self.train.pop(name)
+        self.test.pop(name)
 
     @staticmethod
     def df_column_is_all_null(df, column):
@@ -931,4 +931,160 @@ for _dset_name in ['train', 'test']:
             ('target', 'target')]:
 
         _set_prop(_dset_name, _name, _section)
+
+
+class Model(object):
+    """Encapsulate model with known API for TrainTestSplit use."""
+
+    def __init__(self, model, splitter):
+        self.model = model
+        self.splitter = splitter
+
+    @property
+    def model_name(self):
+        return self.model.__class__.__name__
+
+    @property
+    def model_suffix(self):
+        """All scikit-learn estimators have a `get_params` method."""
+        return naming.suffix_from_params(self.model.get_params())
+
+    @staticmethod
+    def func_kwargs(func):
+        argspec = inspect.getargspec(func)
+        if argspec.defaults is None:
+            return argspec.args
+        else:
+            return argspec.args[-len(argspec.defaults):]
+
+    @staticmethod
+    def func_pargs(func):
+        argspec = inspect.getargspec(func)
+        arglist = argspec.args[1:]  # remove self
+        if argspec.defaults is None:
+            return arglist
+        else:
+            return arglist[:-len(argspec.defaults)]
+
+
+class SklearnModel(Model):
+    """Encapsulate estimator with scikit-learn API for TrainTestSplit use."""
+
+    @property
+    def fit_kwargs(self):
+        """Keyword arguments to model `fit` method."""
+        return self.func_kwargs(self.model.fit)
+
+    @property
+    def fit_pargs(self):
+        """Positional arguments to model `fit` method."""
+        return self.func_pargs(self.model.fit)
+
+    @property
+    def predict_kwargs(self):
+        """Keyword arguments to model `predict` method."""
+        return self.func_kwargs(self.model.predict)
+
+    @property
+    def predict_pargs(self):
+        """Positional arguments to model `predict` method."""
+        return self.func_pargs(self.model.predict)
+
+    @property
+    def model_params(self):
+        """Return model params learned during fitting."""
+        params = [attr for attr in dir(self.model)
+                  if not attr.endswith('__') and attr.endswith('_')]
+
+        # In older versions of sklearn, some parameters ending in "_" (learned
+        # during model fitting) were set in __init__ or declared as properties.
+        # These were deprecated in v0.17 and will be removed in v0.19. However,
+        # we still look for them here.
+        to_remove = []
+        for attr in params:
+            try:
+                getattr(self.model, attr)
+            except AttributeError:
+                to_remove.append(attr)
+
+        for attr in to_remove:
+            params.remove(attr)
+
+        return params
+
+
+class SklearnRegressionModel(SklearnModel):
+
+    def fit_predict(self, val):
+        split = self.splitter[val]
+        train_X, train_y, train_eids,\
+        test_X, test_y, test_eids, indices, nents = \
+            split.preprocess(all_null='drop')
+
+        # Pass in only keyword arguments the model actually needs for fitting.
+        # This is accomplished via function argspec inspection.
+        all_kwargs = {'entity_ids': train_eids,
+                      'feature_indices': indices,
+                      'n_entities': nents}
+        kwargs = {k: v for k, v in all_kwargs.items() if k in self.fit_kwargs}
+        self.model.fit(train_X, train_y, **kwargs)
+
+        # Make predictions using the learned model.
+        kwargs = {k: v for k, v in all_kwargs.items()
+                  if k in self.predict_kwargs}
+        pred_y = self.model.predict(test_X, **kwargs)
+        return RegressionResults(pred_y, split.test, split.fguide)
+
+    def fit_predict_all(self, n_jobs=1):
+        """Run sequential fit/predict loop for all possible data splits in a
+        generative manner.
+
+        This should eventually account for:
+
+        1.  parallel evaluation if using batch methods
+        2.  results not fitting in memory
+        3.  optional reassembly of full data frame with original and predicted
+            results.
+        """
+        pass
+
+
+class Results(object):
+    """Encapsulate model prediction results & metadata for evaluation."""
+
+    def __init__(self, predicted, test_data, fguide):
+        self.fguide = fguide
+        self.pred_colname = '%s_predicted' % fguide.target
+        self.test_data = test_data
+        self.test_data[self.pred_colname] = predicted
+
+    @property
+    def predicted(self):
+        return self.test_data[self.pred_colname]
+
+    @property
+    def actual(self):
+        return self.test_data[self.fguide.target]
+
+
+class RegressionResults(Results)
+    """Encapsulate model regression predictions & metadata for evaluation."""
+
+    def error(self):
+        return self.predicted - self.actual
+
+    def squared_error(self):
+        return self.error() ** 2
+
+    def sse(self):
+        return self.squared_error().sum()
+
+    def mse(self):
+        return self.squared_error().mean()
+
+    def rmse(self):
+        return np.sqrt(self.mse())
+
+    def mae(self):
+        return abs(self.error()).mean()
 
