@@ -4,6 +4,7 @@ datasets for ML applications. These tools can be used by a variety of models to
 quickly convert diverse datasets to appropriate formats for learning.
 """
 import os
+import inspect
 import logging
 import argparse
 import operator
@@ -16,6 +17,7 @@ import seaborn as sns
 from sklearn import preprocessing
 
 from oset import OrderedSet
+import naming
 
 
 class BadFeatureConfig(Exception):
@@ -399,7 +401,7 @@ class PandasFullDataset(PandasDataset):
 
             if not scaled:
                 self.scalers[col] = (scaler, True)
-                self.dataset[col] = scaler.fit_transform(self.dataset[col])
+                self.dataset[col] = scaler.fit_transform(self.dataset[[col]])
 
     def scale_reals(self):
         if self.fguide.real_valueds:
@@ -525,9 +527,61 @@ class PandasFullDataset(PandasDataset):
         return PandasTrainTestSplit(train, test, self.fguide)
 
     def split_loop(self, col, train_cmp, test_cmp):
-        column = self.dataset[col]
-        for val in column.unique():
-            yield self.split(train_cmp(column, val), test_cmp(column, val))
+        return PandasDatasetSplitter(self, col, train_cmp, test_cmp)
+
+
+class PandasDatasetSplitter(object):
+    """Iterator for all possible train/test splits using given col & ops."""
+
+    def __init__(self, dataset, colname, train_cmp, test_cmp):
+        """
+        Args:
+            dataset (PandasFullDataset): The dataset to produce
+                train/test splits from.
+            colname (str): Name of the column to use for splitting
+                comparisons.
+            train_cmp (function): Comparison function to use for
+                getting the subset to be used for training data.
+            test_cmp (function): Comparison function to use for
+                getting the subset to be used for testing data.
+        """
+        self.dataset = dataset
+        self.colname = colname
+        self.train_cmp = train_cmp
+        self.test_cmp = test_cmp
+
+    @property
+    def column(self):
+        return self.dataset.dataset[self.colname]
+
+    @property
+    def unique_values(self):
+        return self.column.unique()
+
+    @property
+    def np_splits(self):
+        return self.unique_values.shape[0]
+
+    def __iter__(self):
+        column = self.column
+        for val in self.unique_values:
+            yield self.dataset.split(
+                self.train_cmp(column, val), self.test_cmp(column, val))
+
+    def iteritems(self):
+        column = self.column
+        for val in self.unique_values:
+            yield (val, self.dataset.split(
+                self.train_cmp(column, val), self.test_cmp(column, val)))
+
+    def __getitem__(self, val):
+        if val not in self.unique_values:
+            raise ValueError(
+                'value {} not in column {}'.format(val, self.colname))
+
+        column = self.column
+        return self.dataset.split(
+            self.train_cmp(column, val), self.test_cmp(column, val))
 
 
 class PandasTrainTestSplit(PandasDataset):
@@ -721,8 +775,8 @@ class PandasTrainTestSplit(PandasDataset):
 
             if not scaled:
                 self.scalers[col] = (scaler, True)
-                self.train.loc[:, col] = scaler.fit_transform(self.train[col])
-                self.test.loc[:, col] = scaler.transform(self.test[col])
+                self.train.loc[:, col] = scaler.fit_transform(self.train[[col]])
+                self.test.loc[:, col] = scaler.transform(self.test[[col]])
 
     def scale_reals(self):
         if self.fguide.real_valueds:
@@ -856,7 +910,7 @@ class PandasTrainTestSplit(PandasDataset):
 
 
 # Add properties to PandasTrainTestSplit for quick feature section access.
-def set_prop(dset_name, name, section):
+def _set_prop(dset_name, name, section):
     def get_section(self):
         dset = getattr(self, dset_name)
         names = getattr(self.fguide, section)
@@ -868,12 +922,13 @@ def set_prop(dset_name, name, section):
     setattr(PandasTrainTestSplit, '%s_%s' % (dset_name, name),
             property(get_section))
 
-for dset_name in ['train', 'test']:
-    for name, section in [
+for _dset_name in ['train', 'test']:
+    for _name, _section in [
             ('reals', 'real_valueds'),
             ('categoricals', 'categoricals'),
             ('entities', 'entities'),
             ('key', 'key'),
             ('target', 'target')]:
 
-        set_prop(dset_name, name, section)
+        _set_prop(_dset_name, _name, _section)
+
