@@ -2,16 +2,20 @@
 Model and Results classes for encapsualting ML method train and predict logic
 as well as prediction evaluation logic.
 """
+import os
 import inspect
+import warnings
+import importlib
 
 import naming
+import saveload
+
 
 class Model(object):
     """Encapsulate model with known API for TrainTestSplit use."""
 
-    def __init__(self, model, splitter):
+    def __init__(self, model):
         self.model = model
-        self.splitter = splitter
 
     @property
     def model_name(self):
@@ -20,7 +24,24 @@ class Model(object):
     @property
     def model_suffix(self):
         """All scikit-learn estimators have a `get_params` method."""
-        return naming.suffix_from_params(self.model.get_params())
+        return naming.suffix_from_params(self.fixed_params())
+
+    @property
+    def fixed_params(self):
+        raise NotImplementedError('fixed_params not implemented')
+
+    @property
+    def learned_params(self):
+        raise NotImplementedError('learned_params not implemented')
+
+    @property
+    def all_params(self):
+        params = self.fixed_params
+        params.update(self.learned_params)
+        return params
+
+    def clone(self):
+        return self.__class__(**self.fixed_params)
 
     @staticmethod
     def func_kwargs(func):
@@ -39,9 +60,57 @@ class Model(object):
         else:
             return arglist[:-len(argspec.defaults)]
 
+    def save(self, savedir, ow=False):
+        params = {
+            'fixed': self.fixed_params,
+            'learned': self.learned_params,
+            'metadata': {
+                'name': self.model_name,
+                'module': self.model.__module__
+            }
+        }
+        saveload.save_var_tree(params, savedir, ow)
+
+    @classmethod
+    def load(cls, savedir):
+        params = saveload.load_var_tree(savedir)
+        model_module = importlib.import_module(params['metadata']['module'])
+        model_class = getattr(model_module, params['metadata']['name'])
+        inner_model = model_class(**params['fixed'])
+
+        model = cls(inner_model)
+        for learned_param, val in params['learned'].items():
+            setattr(model, learned_param, val)
+        return model
+
 
 class SklearnModel(Model):
     """Encapsulate estimator with scikit-learn API for TrainTestSplit use."""
+
+    @property
+    def fixed_params(self):
+        return self.model.get_params()
+
+    @property
+    def learned_params(self):
+        params = [attr for attr in dir(self.model)
+                  if not attr.endswith('__') and attr.endswith('_')]
+
+        # In older scikit-learn versions, some of the learned parameters (those
+        # ending in _) were set in the __init__ method. As of v0.17, these are
+        # deprecated, and they will be removed in v0.19. We suppress the
+        # warnings here and catch the AttributeErrors that pop up when these
+        # parameters are implemented as properties and not initially set.
+        available_params = {}
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            for param in params:
+                try:
+                    available_params[param] = getattr(self.model, param)
+                except AttributeError:
+                    pass
+
+        return available_params
 
     @property
     def fit_kwargs(self):
@@ -63,24 +132,48 @@ class SklearnModel(Model):
         """Positional arguments to model `predict` method."""
         return self.func_pargs(self.model.predict)
 
+    def fit(self, X, y, *args, **kwargs):
+        pass
 
-class SklearnRegressionModel(SklearnModel):
+    def predict(self, X, y, *args, **kwargs):
+        pass
+
+
+class SklearnRegressionRunner(object):
+
+    def __init__(self, model, splitter):
+        """Wrap up a Model with a TrainTestSplitter with methods for training
+        the model on the various train/test splits produced by the splitter.
+
+        Args:
+            model (Model): The model to train and predict with.
+            splitter (TrainTestSplitter): The splitter to use for producing
+                train/test data splits.
+        """
+        self.model = model
+        self.splitter = splitter
 
     def fit_predict(self, val):
+        """Get the train/test set for `val`, train a copy of the model with the
+        same parameters on the train set, and then predict for the test set.
+        Return a RegressionResults object with the results, including the
+        learned model parameters.
+        """
         split = self.splitter[val]
         train_X, train_y, train_eids,\
         test_X, test_y, test_eids, indices, nents = \
             split.preprocess(all_null='drop')
 
         # Create copy of model with same params.
-        model = self.model.__class__(**self.model.get_params())
+        model = self.model.clone()
 
         # Pass in only keyword arguments the model actually needs for fitting.
         # This is accomplished via function argspec inspection.
         all_kwargs = {'entity_ids': train_eids,
                       'feature_indices': indices,
                       'n_entities': nents}
-        kwargs = {k: v for k, v in all_kwargs.items() if k in self.fit_kwargs}
+        kwargs = {k: v for k, v in all_kwargs.items()
+                  if k in self.model.fit_kwargs}
         model.fit(train_X, train_y, **kwargs)
 
         # Make predictions using the learned model.
