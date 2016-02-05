@@ -22,6 +22,7 @@ class BadFeatureConfig(Exception):
     """Raise when bad feature configuration file is found."""
     pass
 
+
 class FeatureGuide(object):
     """Parse and represent fields of a feature guide."""
 
@@ -108,6 +109,42 @@ class FeatureGuide(object):
 
         # Extract target variable from its list and store solo.
         self.target = self.target[0]
+
+    def save(self, savedir='.', fname=None):
+        """Save the feature guide to the given directory. The basename of the
+        file read to create the feature guide is used by default. This can be
+        overwritten by passing `fname`.
+
+        Args:
+            savedir (str): The directory to save the config file to. Defaults
+                to the current working directory.
+            fname (str): Optional file name to save the feature guide to. Any
+                extension will be removed and replaced with ".conf". The
+                basename of the file is used by default.
+        """
+        # Build up the file path to write to.
+        dirpath = os.path.abspath(savedir)
+        if fname is None:
+            fname = os.path.basename(self.fname)
+
+        name = os.path.splitext(fname)[0]
+        path = os.path.join(dirpath, name + '.conf')
+
+        # Put all comments and attributes into string formats.
+        lines = ['# %s' % comment for comment in self.comments]
+        lines.append('')
+        for letter, section in self.config_guide.items():
+            names = getattr(self, section)
+            if names:
+                if isinstance(names, basestring):
+                    line = '%s: %s;' % (letter, names)
+                else:
+                    line = '%s: %s;' % (letter, ', '.join(names))
+                lines.append(line)
+
+        # Write the config.
+        with open(path, 'w') as f:
+            f.write('\n'.join(lines))
 
     def __init__(self, fname):
         """Read the feature guide and parse out the specification.
@@ -200,6 +237,8 @@ be possible that other forms exist (e.g. with a hold-out set) we use a factory
 to load the datasets. By making the first argument to the factory an optional
 iterable, we can initialize differently based on the number of filenames
 present.
+
+TODO: not actually using a factory yet.
 """
 class Dataset(object):
     """Represent a complete dataset existing in one file."""
@@ -220,12 +259,14 @@ class PandasDataset(Dataset):
 
     @staticmethod
     def index_from_feature_guide(fguide):
-        """Return an appropriate index column name based on the feature guide.
-        We should use the index as the index if it is present.
-        If the index is not present, we should use the key as the index only
-        if none of those fields are also used as features.
-        If some of those fields are used as features, we should simply make a
-        new index and add it to the feature guide; in this case, return None.
+        """Return an appropriate index column name based on the feature guide
+        -- acording to the following rules:
+
+        1.  We should use the index as the index if it is present.
+        2.  If the index is not present, we should use the key as the index
+            only if none of those fields are also used as features.
+        3.  If some of those fields are used as features, we should make a new
+            index and add it to the feature guide; in this case, return None.
         """
         if fguide.index:
             return list(fguide.index)
@@ -238,6 +279,47 @@ class PandasDataset(Dataset):
     def index_colname(self):
         return self.index_from_feature_guide(self.fguide)
 
+    @staticmethod
+    def read_using_fguide(fname, fguide):
+        """Read a DataFrame from the file. Load only the columns that show up
+        in the feature guide and set the index intelligently using
+        `PandasDataset.index_colname`.
+
+        Currently this assumes csv files.
+
+        Args:
+            fname (str): Name of the file to read the DataFrame from.
+            fguide (FeatureGuide): The feature guide to extract the index and
+                the list of columns from.
+        Return:
+            df (pd.DataFrame): DataFrame read from the file.
+        """
+        kwargs = {
+            'index_col': PandasDataset.index_from_feature_guide(fguide),
+            'usecols': fguide.all_names
+        }
+        return pd.read_csv(fname, **kwargs)
+
+    def read(self, fname):
+        """Read a DataFrame from the file. Load only the columns that show up
+        in the feature guide and set the index intelligently using
+        `PandasDataset.index_colname`.
+
+        Currently this assumes csv files.
+
+        Args:
+            fname (str): Name of the file to read the DataFrame from.
+        Return:
+            df (pd.DataFrame): DataFrame read from the file.
+        """
+        return self.read_using_fguide(fname, self.fguide)
+
+    @staticmethod
+    def write_using_fguide(df, fname, fguide):
+        index_col = PandasDataset.index_from_feature_guide(fguide)
+        kwargs = {'index': index_col is not None}
+        df.to_csv(fname, **kwargs)
+
 
 class PandasFullDataset(PandasDataset):
 
@@ -247,12 +329,7 @@ class PandasFullDataset(PandasDataset):
         """
         self.fguide = fguide = FeatureGuide(config_file)
         self.fname = os.path.abspath(fname)
-
-        # We only need to load the columns that show up in the config file.
-        index_col = self.index_colname()
-        # Note that pandas interprets index_col=None as "make new index."
-        self.dataset = pd.read_csv(
-            fname, usecols=fguide.all_names, index_col=index_col)
+        self.dataset = self.read(self.fname)
 
         # Instance variables to store metadata generated during transformations.
         self.column_maps = {}  # mapping from one space to another

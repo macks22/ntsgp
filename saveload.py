@@ -179,7 +179,7 @@ def save_var_tree(tree, savedir, ow=False):
 
 def load_var_tree(savedir):
     """Mirror function for `save_var_tree`."""
-    subdirnames = os.listdir(savedir)
-    return {name: load_model_vars(os.path.join(savedir, name))
-            for name in subdirnames}
+    paths = (os.path.join(savedir, name) for name in os.listdir(savedir))
+    subdirs = (path for path in paths if os.path.isdir(path))
+    return {os.path.basename(path): load_model_vars(path) for path in subdirs}
 

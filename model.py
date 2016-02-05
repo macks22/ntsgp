@@ -7,6 +7,9 @@ import inspect
 import warnings
 import importlib
 
+import numpy as np
+
+import mldata
 import naming
 import saveload
 
@@ -41,7 +44,31 @@ class Model(object):
         return params
 
     def clone(self):
-        return self.__class__(**self.fixed_params)
+        model_module = importlib.import_module(self.model.__module__)
+        model_class = getattr(model_module, self.model_name)
+        inner_model = model_class(**self.fixed_params)
+
+        model = self.__class__(inner_model)
+        for learned_param, val in self.learned_params.items():
+            setattr(model, learned_param, val)
+        return model
+
+    def __eq__(self, other):
+        my_params = self.all_params
+        other_params = other.all_params
+        if len(my_params) != len(other_params):
+            return False
+
+        for key in my_params.keys():
+            my_val = my_params[key]
+            if hasattr(my_val, 'shape'):  # comparing numpy arrays
+                if not np.allclose(my_val, other_params[key]):
+                    return False
+            else:  # normal value comparison
+                if not my_val == other_params[key]:
+                    return False
+
+        return True
 
     @staticmethod
     def func_kwargs(func):
@@ -65,6 +92,7 @@ class Model(object):
             'fixed': self.fixed_params,
             'learned': self.learned_params,
             'metadata': {
+                'class': self.__class__.__name__,
                 'name': self.model_name,
                 'module': self.model.__module__
             }
@@ -73,15 +101,27 @@ class Model(object):
 
     @classmethod
     def load(cls, savedir):
+        """Load the model from the savedir.
+
+        This assumes the Model subclass exists in this module.
+        """
         params = saveload.load_var_tree(savedir)
         model_module = importlib.import_module(params['metadata']['module'])
         model_class = getattr(model_module, params['metadata']['name'])
         inner_model = model_class(**params['fixed'])
 
-        model = cls(inner_model)
+        outer_class = globals()[params['metadata']['class']]
+        model = outer_class(inner_model)
         for learned_param, val in params['learned'].items():
             setattr(model, learned_param, val)
         return model
+
+
+def key_intersect(dict1, dict2):
+    """Return a dictionary with only the elements of the first dictionary that
+    have keys which overlap with those of the second.
+    """
+    return {k: v for k, v in dict1.items() if k in dict2}
 
 
 class SklearnModel(Model):
@@ -113,6 +153,11 @@ class SklearnModel(Model):
         return available_params
 
     @property
+    def fitted(self):
+        """Has the model been fitted?"""
+        return len(self.learned_params) > 0
+
+    @property
     def fit_kwargs(self):
         """Keyword arguments to model `fit` method."""
         return self.func_kwargs(self.model.fit)
@@ -132,11 +177,21 @@ class SklearnModel(Model):
         """Positional arguments to model `predict` method."""
         return self.func_pargs(self.model.predict)
 
-    def fit(self, X, y, *args, **kwargs):
-        pass
+    def fit(self, X, y, **kwargs):
+        """Fit the model. This method uses introspection to determine which
+        keyword arguments are accepted and only passes those through.
+        """
+        filtered_kwargs = key_intersect(kwargs, self.fit_kwargs)
+        self.model.fit(X, y, **filtered_kwargs)
+        return self
 
-    def predict(self, X, y, *args, **kwargs):
-        pass
+    def predict(self, X, **kwargs):
+        """Predict new target variables using the fitted model. This method
+        uses introspection to determine which keyword arguments are accepted
+        and only passes those through.
+        """
+        filtered_kwargs = key_intersect(kwargs, self.predict_kwargs)
+        return self.model.predict(X, **filtered_kwargs)
 
 
 class SklearnRegressionRunner(object):
@@ -167,18 +222,11 @@ class SklearnRegressionRunner(object):
         # Create copy of model with same params.
         model = self.model.clone()
 
-        # Pass in only keyword arguments the model actually needs for fitting.
-        # This is accomplished via function argspec inspection.
-        all_kwargs = {'entity_ids': train_eids,
-                      'feature_indices': indices,
-                      'n_entities': nents}
-        kwargs = {k: v for k, v in all_kwargs.items()
-                  if k in self.model.fit_kwargs}
+        # Extraneous kwargs are filtered by the fit/predict methods.
+        kwargs = {'entity_ids': train_eids,
+                  'feature_indices': indices,
+                  'n_entities': nents}
         model.fit(train_X, train_y, **kwargs)
-
-        # Make predictions using the learned model.
-        kwargs = {k: v for k, v in all_kwargs.items()
-                  if k in self.predict_kwargs}
         pred_y = model.predict(test_X, **kwargs)
         return RegressionResults(pred_y, split.test, split.fguide, model)
 
@@ -199,16 +247,18 @@ class SklearnRegressionRunner(object):
 class Results(object):
     """Encapsulate model prediction results & metadata for evaluation."""
 
+    _predicted_suffix = '_predicted'
+
     def __init__(self, predicted, test_data, fguide, model):
         self.fguide = fguide
-        self.pred_colname = '%s_predicted' % fguide.target
+        self._pred_colname = '%s%s' % (fguide.target, self._predicted_suffix)
         self.test_data = test_data
-        self.test_data.loc[:, self.pred_colname] = predicted
+        self.test_data.loc[:, self._pred_colname] = predicted
         self.model = model
 
     @property
     def predicted(self):
-        return self.test_data[self.pred_colname]
+        return self.test_data[self._pred_colname]
 
     @property
     def actual(self):
@@ -217,9 +267,67 @@ class Results(object):
     @property
     def model_params(self):
         """Return model params learned during fitting."""
-        params = [attr for attr in dir(self.model)
-                  if not attr.endswith('__') and attr.endswith('_')]
-        return {param: getattr(self.model, param) for param in params}
+        return self.model.learned_params
+
+    def save(self, savedir, ow=False):
+        """Save the results, including the test data (with predictions in one
+        column), the feature guide, and the learned model.
+
+        Args:
+            savedir (str): Name of directory to save results to.
+            ow (bool): Whether to overwrite the directory if it exists.
+        Raises:
+            OSError: if savedir exists and ow=False.
+        """
+        # The Model save method handles creating the directory if it doesn't
+        # exist, or raising OSError if it does and ow=False.
+        self.model.save(savedir, ow)
+
+        # Save the name of the column with the predicted data.
+        # This allows easy reloading.
+        self.fguide.real_valueds.add(self._pred_colname)
+        self.fguide.save(savedir)
+
+        test_path = os.path.join(savedir, 'test-data.csv')
+        mldata.PandasDataset.write_using_fguide(
+            self.test_data, test_path, self.fguide)
+
+    @classmethod
+    def load(cls, savedir):
+        """Load Results from the savedir. Mirrors `Results.save`.
+
+        Args:
+            savedir (str): Name of directory to load results from.
+        Return:
+            results (Results): New instantiation of Results class with loaded
+                model, feature guide, and test data (including prediction in
+                one column).
+        """
+        # Read the model.
+        model = Model.load(savedir)
+
+        # Read the feature guide.
+        fguide_fname = [name for name in os.listdir(savedir)
+                        if name.endswith('.conf')][0]
+        fguide_path = os.path.join(savedir, fguide_fname)
+        fguide = mldata.FeatureGuide(fguide_path)
+
+        # Read the test data.
+        test_data = mldata.PandasDataset.read_using_fguide(
+            os.path.join(savedir, 'test-data.csv'), fguide)
+
+        try:
+            predicted_colname = \
+                [name for name in test_data.columns
+                 if name.endswith(cls._predicted_suffix)][0]
+            predicted = test_data[predicted_colname].values
+
+            # Remove predicted data column name.
+            fguide.remove(predicted_colname)
+        except IndexError:
+            raise ValueError('prediced data not found in test_data file')
+
+        return cls(predicted, test_data, fguide, model)
 
 
 class RegressionResults(Results):
