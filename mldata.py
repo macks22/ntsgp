@@ -643,11 +643,33 @@ class PandasDatasetSplitter(object):
             yield self.dataset.split(
                 self.train_cmp(column, val), self.test_cmp(column, val))
 
-    def iteritems(self):
+    def iteritems(self, errors='log'):
+        """Iterate over all possible splits, returning each in a tuple with its
+        associated value.
+
+        Args:
+            errors (str): One of {'raise', 'log', 'ignore'}, this specifies how
+                errors that occur during production of TrainTestSplit objects
+                should be handled.
+                If "raise": simply let errors propogate.
+                If "log": log the error with level `logging.ERROR`.
+                If "ignore": log with level `logging.INFO`.
+        Return:
+            generator of (val, TrainTestSplit) pairs.
+        """
         column = self.column
         for val in self.unique_values:
-            yield (val, self.dataset.split(
-                self.train_cmp(column, val), self.test_cmp(column, val)))
+            try:
+                split = self.dataset.split(
+                    self.train_cmp(column, val), self.test_cmp(column, val))
+                yield (val, split)
+            except Exception as err:
+                if errors == 'raise':
+                    raise
+                elif errors == 'log':
+                    logging.error(str(err))
+                else:
+                    logging.info(str(err))
 
     def __getitem__(self, val):
         if val not in self.unique_values:
@@ -697,6 +719,18 @@ class PandasTrainTestSplit(PandasDataset):
         return cls(train, test, fguide)
 
     def __init__(self, train_df, test_df, fguide):
+        # Sanity checks
+        train_nsamples, train_ncols = train_df.shape[:2]
+        test_nsamples, test_ncols = test_df.shape[:2]
+
+        if train_nsamples == 0:  # must have training data
+            raise ValueError('training set has 0 samples')
+        if test_nsamples == 0:   # must have test data
+            raise ValueError('testing set has 0 samples')
+        if train_ncols != test_ncols:  # columns must match
+            raise ValueError('# train cols != # test cols (%d != %d)' % (
+                train_ncols, test_ncols))
+
         self.train = train_df
         self.test = test_df
         self.fguide = fguide

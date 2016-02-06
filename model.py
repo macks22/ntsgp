@@ -4,8 +4,10 @@ as well as prediction evaluation logic.
 """
 import os
 import inspect
+import logging
 import warnings
 import importlib
+import collections
 
 import numpy as np
 
@@ -208,13 +210,17 @@ class SklearnRegressionRunner(object):
         self.model = model
         self.splitter = splitter
 
-    def fit_predict(self, val):
-        """Get the train/test set for `val`, train a copy of the model with the
-        same parameters on the train set, and then predict for the test set.
-        Return a RegressionResults object with the results, including the
-        learned model parameters.
+    def fit_predict(self, split):
+        """Take a TrainTestSplit and train a copy of the model with the same
+        parameters on the train set, and then predict for the test set.  Return
+        a RegressionResults object with the results, including the learned
+        model parameters.
+
+        Args:
+            split (TrainTestSplit): Train on the training data and predict for
+                the test data.
+        Return: instance of ResultsSet.
         """
-        split = self.splitter[val]
         train_X, train_y, train_eids,\
         test_X, test_y, test_eids, indices, nents = \
             split.preprocess(all_null='drop')
@@ -230,7 +236,22 @@ class SklearnRegressionRunner(object):
         pred_y = model.predict(test_X, **kwargs)
         return RegressionResults(pred_y, split.test, split.fguide, model)
 
-    def fit_predict_all(self, n_jobs=1):
+    def fit_predict_for_value(self, val):
+        """Get the train/test set for `val`, train a copy of the model with the
+        same parameters on the train set, and then predict for the test set.
+        Return a RegressionResults object with the results, including the
+        learned model parameters.
+
+        Args:
+            val (object): The key to use to lookup the TrainTestSplit using the
+                Splitter. For a PandasDataset, this is a value of the column
+                name being used for splitting.
+        Return: instance of ResultsSet.
+        """
+        split = self.splitter[val]
+        return self.fit_predict(split, **kwargs)
+
+    def fit_predict_all(self, n_jobs=1, errors='log'):
         """Run sequential fit/predict loop for all possible data splits in a
         generative manner.
 
@@ -240,8 +261,21 @@ class SklearnRegressionRunner(object):
         2.  results not fitting in memory
         3.  optional reassembly of full data frame with original and predicted
             results.
+
+        Args:
+            n_jobs (int): Number of jobs to use for parallel processing of the
+                multiple TrainTestSplits.
+            errors (str): see `mldata.TrainTestSplitter.iteritems`.
+        Return: instance of ResultsSet.
         """
-        pass
+        results = {}
+        for val, split in self.splitter.iteritems(errors):
+            logging.info('fit/predict for split {}'.format(val))
+            results[val] = self.fit_predict(split)
+
+        # TODO: return RegressionResultsSet instead.
+        print(results)
+        return ResultsSet(results)
 
 
 class Results(object):
@@ -351,3 +385,178 @@ class RegressionResults(Results):
     def mae(self):
         return abs(self.error()).mean()
 
+
+class ResultsSet(Results):
+    """Wrap up several related Results objects for aggregate analysis."""
+
+    @staticmethod
+    def validate_result_compatibility(results):
+        """Ensure the iterable of results can be combined into a ResultsSet.
+
+        There are three criteria for this to work. Each must have:
+
+        1.  same predicted column name
+        2.  equivalent feature guides
+        3.  same test data columns and dimensions
+
+        The first Result in the iterable is used as the benchmark and compared
+        to the others.
+
+        Args:
+            results (iterable of Results): Iterable of Results objects.
+        Raises:
+            ValueError: if there is a mismatch in any of the three necessary
+                criteria for compatibility or the iterable is empty.
+        """
+        # Use the first Result object as the baseline.
+        results = list(results)
+        try:
+            result0 = results[0]
+        except IndexError:
+            raise ValueError('no results in the iterable')
+
+        # (1) same predicted column name.
+        for i, result in enumerate(results):
+            if result.predicted.name != result0.predicted.name:
+                raise ValueError(
+                    'Result %d predicted column name "%s" != "%s"' % (
+                        i, result.predicted.name, result0.predicted.name))
+
+        # (2) equivalent feature guides.
+        fguide0 = result0.fguide
+        for i, result in enumerate(results):
+            if result.fguide != fguide0:
+                raise ValueError(
+                    'Result %d feature guide != Result 0 feature guide' % i)
+
+        # (3) same dimensions and columns for the test data.
+        columns0 = np.sort(result0.test_data.columns)
+        ncols0 = result0.test_data.shape[1]
+        for i, result in enumerate(results):
+            if result.test_data.shape[1] != ncols0:
+                raise ValueError(
+                    '# cols in Result %d test data != # cols in Result 0 test'
+                    ' data (%d != %d)' % (
+                        i, result.test_data.shape[1], ncols0))
+            try:
+                columns = np.sort(result.test_data.columns)
+                matched = columns0 == columns
+                mismatched = not matched.all()
+            except ValueError:  # shape mismatch
+                mismatched = True
+            finally:
+                if mismatched:
+                    raise ValueError(
+                        'Result {} test data columns not equal to'
+                        ' Result 0 test data columns: {} != {}'.format(
+                            i, np.sort(result.test_data.columns), columns0))
+
+    def __init__(self, results):
+        """Initialize the ResultsSet.
+
+        Args:
+            results (dict of Results): Results objects that are related. One
+                examples would be predictions from a common dataset split on
+                different values of the same column. The keys of the dict will
+                be used to order the results and to look them up. One choice
+                would be the value of the column used to perform trian/test
+                splitting. If splits are generated randomly, any ordinals will
+                do.
+        Raises:
+            ValueError: if the results are not compatible (see
+                `validate_result_compatibility`).
+        """
+        # If the results don't match up, we should fail early, so perform
+        # necessary sanity checks here.
+        self.results = collections.OrderedDict(sorted(results.items()))
+        self.validate_result_compatibility(self.results.values())
+
+        self._pred_colname = results[0].predicted.name
+        self.fguide = results[0].fguide
+
+    def __getitem__(self, key):
+        return self.results[key]
+
+    def __iter__(self):
+        return self.results.iterkeys()
+
+    def iteritems(self):
+        return self.results.iteritems()
+
+    def iter_results(self):
+        return self.results.itervalues()
+
+    @property
+    def test_data(self):
+        return pd.concat([result.test_data for result in self.results.values()])
+
+    @property
+    def predicted(self):
+        return self.test_data[self._pred_colname]
+
+    @property
+    def actual(self):
+        return self.test_data[self.fguide.target]
+
+    @property
+    def model_params(self):
+        """Return model params learned during fitting."""
+        return {key: result.model.learned_params
+                for (key, result) in self.results.items()}
+
+    def save(self, savedir, ow=False):
+        """Save all results in the savedir, with each individual result saved
+        in a subdirectory named using its key.
+
+        Args:
+            savedir (str): Name of directory to save results to.
+            ow (bool): Whether to overwrite the directory if it exists.
+        Raises:
+            OSError: if savedir exists and ow=False.
+        """
+        dirpath = os.path.abspath(savedir)
+        logging.info('saving results set to %s' % dirpath)
+        saveload.make_or_replace_dir(dirpath, ow)
+
+        # Save each result to a new subdirectory named by its key.
+        for key, result in self.results.items():
+            path = os.path.join(dirpath, str(key))
+            result.save(path, ow)
+
+        # Save the Results class being used for proper reload.
+        metadata_file = os.path.join(dirpath, 'metadata.txt')
+        with open(metadata_file, 'w') as f:
+            f.write(self.results[0].__class__.__name__)
+
+    @classmethod
+    def load(cls, savedir):
+        """Load Results from the savedir. Mirrors `ResultsSet.save`.
+
+        Args:
+            savedir (str): Name of directory to load results from.
+        Return:
+            resultsSet (ResultsSet): New instantiation of ResultsSet class
+                loaded from savedir.
+        """
+        dirpath = os.path.abspath(savedir)
+        logging.info('loading results set from %s' % dirpath)
+
+        # First read metadata. We do this first mostly as an easy way to
+        # validate if this directory actually has a ResultsSet saved in it.
+        metadata_file = os.path.join(dirpath, 'metadata.txt')
+        with open(metadata_file) as f:
+            results_class_name = f.read().strip()
+
+        # Look up the actual class object in the module namespace.
+        results_class = globals()[results_class_name]
+
+        # Next parse the directory structure to get the Results keys and the
+        # directory names where each was saved.
+        paths = [os.path.join(dirpath, name) for name in os.listdir(dirpath)]
+        subdir_paths = [path for path in paths if os.path.isdir(path)]
+
+        # Now load each Result and instantiate the ResultsSet.
+        contents = [(os.path.basename(path), results_class.load(path))
+                    for path in subdir_paths]
+        results = collections.OrderedDict(sorted(contents))
+        return cls(results)
