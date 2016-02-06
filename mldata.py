@@ -4,6 +4,7 @@ datasets for ML applications. These tools can be used by a variety of models to
 quickly convert diverse datasets to appropriate formats for learning.
 """
 import os
+import copy
 import logging
 import argparse
 import operator
@@ -184,6 +185,17 @@ class FeatureGuide(object):
             'real-valueds: %s' % ', '.join(self.real_valueds)
         ])
 
+    def __eq__(self, other):
+        for name in self.sections:
+            mine = getattr(self, name)
+            yours = getattr(other, name)
+            if mine != yours:
+                return False
+        return True
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     @property
     def feature_names(self):
         return list(reduce(
@@ -222,6 +234,29 @@ class FeatureGuide(object):
 
         if not removed:
             raise KeyError("feature '%s' not in feature guide" % name)
+
+    def union(self, other):
+        """Perform a per-section union of all sections (including comments) and
+        return a new feature guide with the resulting sections. This requires
+        both sections have the same target.
+
+        Args:
+            other (FeatureGuide): The feature guide to union with.
+        Return:
+            union (FetaureGuide): New instance with unioned sections.
+        """
+        if self.target != other.target:
+            raise ValueError('target mismatch (%s != %s)' % (
+                self.target, other.target))
+
+        union = copy.deepcopy(self)
+        sections = [name for name in self.sections if name != 'target']
+        for name in sections:
+            mine = getattr(union, name)
+            yours = getattr(other, name)
+            setattr(union, name, mine | yours)
+
+        return union
 
 
 """

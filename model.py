@@ -3,6 +3,9 @@ Model and Results classes for encapsualting ML method train and predict logic
 as well as prediction evaluation logic.
 """
 import os
+import copy
+import json
+import pydoc
 import inspect
 import logging
 import warnings
@@ -10,6 +13,7 @@ import importlib
 import collections
 
 import numpy as np
+import pandas as pd
 
 import mldata
 import naming
@@ -274,7 +278,6 @@ class SklearnRegressionRunner(object):
             results[val] = self.fit_predict(split)
 
         # TODO: return RegressionResultsSet instead.
-        print(results)
         return ResultsSet(results)
 
 
@@ -386,6 +389,10 @@ class RegressionResults(Results):
         return abs(self.error()).mean()
 
 
+class ColumnMismatchError(Exception):
+    """Raise when aggregating DataFrame objects with mismatched columns."""
+    pass
+
 class ResultsSet(Results):
     """Wrap up several related Results objects for aggregate analysis."""
 
@@ -403,41 +410,42 @@ class ResultsSet(Results):
         to the others.
 
         Args:
-            results (iterable of Results): Iterable of Results objects.
+            results (OrderedDict of Results): To check compatibility of.
         Raises:
             ValueError: if there is a mismatch in any of the three necessary
                 criteria for compatibility or the iterable is empty.
         """
         # Use the first Result object as the baseline.
-        results = list(results)
         try:
-            result0 = results[0]
-        except IndexError:
+            first_key, first_result = results.iteritems().next()
+        except StopIteration:
             raise ValueError('no results in the iterable')
 
         # (1) same predicted column name.
-        for i, result in enumerate(results):
-            if result.predicted.name != result0.predicted.name:
+        for key, result in results.iteritems():
+            name = result.predicted.name
+            if name != first_result.predicted.name:
                 raise ValueError(
-                    'Result %d predicted column name "%s" != "%s"' % (
-                        i, result.predicted.name, result0.predicted.name))
+                    'Result {} predicted column name "{}" != "{}"'.format(
+                        key, name, first_result.predicted.name))
 
         # (2) equivalent feature guides.
-        fguide0 = result0.fguide
-        for i, result in enumerate(results):
-            if result.fguide != fguide0:
+        first_fguide = first_result.fguide
+        for key, result in results.iteritems():
+            if result.fguide != first_fguide:
                 raise ValueError(
-                    'Result %d feature guide != Result 0 feature guide' % i)
+                    'Result {} feature guide != Result {} feature'
+                    ' guide'.format(key, first_key))
 
         # (3) same dimensions and columns for the test data.
-        columns0 = np.sort(result0.test_data.columns)
-        ncols0 = result0.test_data.shape[1]
-        for i, result in enumerate(results):
-            if result.test_data.shape[1] != ncols0:
-                raise ValueError(
-                    '# cols in Result %d test data != # cols in Result 0 test'
-                    ' data (%d != %d)' % (
-                        i, result.test_data.shape[1], ncols0))
+        columns0 = np.sort(first_result.test_data.columns)
+        ncols0 = first_result.test_data.shape[1]
+        for key, result in results.iteritems():
+            ncols = result.test_data.shape[1]
+            if ncols != ncols0:
+                raise ColumnMismatchError(
+                    '# cols in Result {} test data != # cols in Result {} test'
+                    ' data ({} != {})'.format(key, first_key, ncols, ncols0))
             try:
                 columns = np.sort(result.test_data.columns)
                 matched = columns0 == columns
@@ -446,12 +454,12 @@ class ResultsSet(Results):
                 mismatched = True
             finally:
                 if mismatched:
-                    raise ValueError(
-                        'Result {} test data columns not equal to'
-                        ' Result 0 test data columns: {} != {}'.format(
-                            i, np.sort(result.test_data.columns), columns0))
+                    raise ColumnMismatchError(
+                        'Result {} test data columns not equal to Result {}'
+                        ' test data columns: {} != {}'.format(
+                            key, first_key, columns, columns0))
 
-    def __init__(self, results):
+    def __init__(self, results, col_mismatch='fill'):
         """Initialize the ResultsSet.
 
         Args:
@@ -462,17 +470,50 @@ class ResultsSet(Results):
                 would be the value of the column used to perform trian/test
                 splitting. If splits are generated randomly, any ordinals will
                 do.
+            col_mismatch (str): One of {'fill', 'raise'}, this specifies the
+                action to take if the columns don't match up between all the
+                Result objects test data frames. If 'fill', simply add the
+                column into the test data frames where it is missing with NaN
+                values. If 'raise', raise a ValueError indicating the mismatch.
         Raises:
             ValueError: if the results are not compatible (see
                 `validate_result_compatibility`).
         """
         # If the results don't match up, we should fail early, so perform
         # necessary sanity checks here.
-        self.results = collections.OrderedDict(sorted(results.items()))
-        self.validate_result_compatibility(self.results.values())
+        results = collections.OrderedDict(sorted(results.items()))
+        results_list = results.values()
+        try:
+            self.validate_result_compatibility(results)
+            filled = False
+        except ColumnMismatchError:
+            if col_mismatch == 'raise':
+                raise
 
-        self._pred_colname = results[0].predicted.name
-        self.fguide = results[0].fguide
+            # else fill
+            filled = True
+            test_data_frames = [res.test_data for res in results_list]
+            concat = pd.concat(test_data_frames, join='outer')
+            start = 0
+            for key in results:
+                df = results[key].test_data
+                nsamples = df.shape[0]
+                end = start + nsamples
+                results[key].test_data = concat[start:end].copy()
+                start = end
+
+        self.results = results
+        result0 = results_list[0]
+        self._pred_colname = result0.predicted.name
+
+        if filled:  # there was a column mismatch, combine feature guides.
+            self.fguide = reduce(
+                lambda fg1, fg2: fg1.union(fg2),
+                [result.fguide for result in results_list])
+            for result in results_list:
+                result.fguide = copy.deepcopy(self.fguide)
+        else:  # no mismatch, can simply use the first feature guide.
+            self.fguide = result0.fguide
 
     def __getitem__(self, key):
         return self.results[key]
@@ -523,11 +564,25 @@ class ResultsSet(Results):
             path = os.path.join(dirpath, str(key))
             result.save(path, ow)
 
-        # Save the Results class being used for proper reload.
-        metadata_file = os.path.join(dirpath, 'metadata.txt')
-        with open(metadata_file, 'w') as f:
-            f.write(self.results[0].__class__.__name__)
+        # Save metadata necessary for proper reload.
+        metadata_file = os.path.join(dirpath, 'metadata.json')
+        first_key, first_result = self.results.iteritems().next()
 
+        key_type = type(first_key)
+        if hasattr(key_type, 'item'):  # convert numpy types to native
+            key_type = type(first_key.item())
+        else:
+            key_type = type(first_key)
+
+        metadata = {
+            'key_type': key_type.__name__,  # assume all keys are same type
+            'results_class': first_result.__class__.__name__
+        }
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f)
+
+    # TODO: NaN columns are not being loaded back in; probably has to do with
+    # feature guide.
     @classmethod
     def load(cls, savedir):
         """Load Results from the savedir. Mirrors `ResultsSet.save`.
@@ -543,9 +598,13 @@ class ResultsSet(Results):
 
         # First read metadata. We do this first mostly as an easy way to
         # validate if this directory actually has a ResultsSet saved in it.
-        metadata_file = os.path.join(dirpath, 'metadata.txt')
+        metadata_file = os.path.join(dirpath, 'metadata.json')
         with open(metadata_file) as f:
-            results_class_name = f.read().strip()
+            metadata = json.load(f)
+
+        # Extract metadata.
+        key_type = pydoc.locate(metadata['key_type'])
+        results_class_name = metadata['results_class']
 
         # Look up the actual class object in the module namespace.
         results_class = globals()[results_class_name]
@@ -555,8 +614,10 @@ class ResultsSet(Results):
         paths = [os.path.join(dirpath, name) for name in os.listdir(dirpath)]
         subdir_paths = [path for path in paths if os.path.isdir(path)]
 
-        # Now load each Result and instantiate the ResultsSet.
-        contents = [(os.path.basename(path), results_class.load(path))
+        # Now load each Result and instantiate the ResultsSet, converting the
+        # keys to the appropriate types (from the metadata file).
+        contents = [(key_type(os.path.basename(path)),
+                     results_class.load(path))
                     for path in subdir_paths]
         results = collections.OrderedDict(sorted(contents))
         return cls(results)

@@ -86,6 +86,8 @@ def load_np_vars(savedir, allow_none=True):
     Return:
         vars (dict): Dictionary of variables loaded.
     """
+    logging.info('loading numpy vars from directory %s' % savedir)
+
     vars = {}
     shape_file = os.path.join(savedir, 'shapes.json')
     try:
@@ -101,7 +103,7 @@ def load_np_vars(savedir, allow_none=True):
     for varname, shape in shapes.items():
         var_file = os.path.join(savedir, varname + '.txt')
         vars[varname] = np.loadtxt(var_file).reshape(shape)
-        logging.info('loaded np var %s with shape %s' % (varname, str(shape)))
+        logging.debug('loaded np var %s with shape %s' % (varname, str(shape)))
 
     return vars
 
