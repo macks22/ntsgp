@@ -235,7 +235,7 @@ class FeatureGuide(object):
         if not removed:
             raise KeyError("feature '%s' not in feature guide" % name)
 
-    def union(self, other):
+    def union(self, other, inplace=True):
         """Perform a per-section union of all sections (including comments) and
         return a new feature guide with the resulting sections. This requires
         both sections have the same target.
@@ -249,12 +249,39 @@ class FeatureGuide(object):
             raise ValueError('target mismatch (%s != %s)' % (
                 self.target, other.target))
 
-        union = copy.deepcopy(self)
+        union = self if inplace else copy.deepcopy(self)
+
         sections = [name for name in self.sections if name != 'target']
         for name in sections:
             mine = getattr(union, name)
             yours = getattr(other, name)
             setattr(union, name, mine | yours)
+
+        return union
+
+    @staticmethod
+    def union_all(feature_guides):
+        """Return union of all FeatureGuide objects in iterable. This is more
+        efficient than using FeatureGuide.union repeatedly since it only makes
+        one copy.
+
+        Args:
+            feature_guides (iterable of FeatureGuide)
+        Return:
+            union (FeatureGuide): A new FeatureGuide where each section is the
+                union of the same section for all FeatureGuide objects in the
+                iterable.
+        Raises:
+            ValueError: if any of the targets do not match.
+        """
+        if len(set(fg.target for fg in feature_guides)) != 1:
+            raise ValueError('target is not the same in all FeatureGuides')
+
+        union = copy.deepcopy(feature_guides[0])
+        others = feature_guides[1:]
+        sections = [name for name in union.sections if name != 'target']
+        for name in sections:
+            getattr(union, name).union(*[getattr(fg, name) for fg in others])
 
         return union
 
@@ -418,6 +445,7 @@ class PandasFullDataset(PandasDataset):
                 section of the feature guide.
             KeyError: if the name is not in feature guide or not in the dataset.
         """
+        logging.info('removing feature %s' % name)
         self.fguide.remove(name)
         self.dataset.pop(name)
 
@@ -634,7 +662,7 @@ class PandasFullDataset(PandasDataset):
         """
         train = self.dataset.loc[train_mask]
         test = self.dataset.loc[test_mask]
-        return PandasTrainTestSplit(train, test, self.fguide)
+        return PandasTrainTestSplit.from_dfs(train, test, self.fguide)
 
     def split_loop(self, col, train_cmp, test_cmp):
         return PandasDatasetSplitter(self, col, train_cmp, test_cmp)
@@ -751,7 +779,7 @@ class PandasTrainTestSplit(PandasDataset):
             train = train_df.set_index(index_col)[usecols]
             test = test_df.set_index(index_col)[usecols]
 
-        return cls(train, test, fguide)
+        return cls(train, test, copy.deepcopy(fguide))
 
     def __init__(self, train_df, test_df, fguide):
         # Sanity checks
@@ -808,6 +836,7 @@ class PandasTrainTestSplit(PandasDataset):
                 section of the feature guide.
             KeyError: if the name is not in feature guide or not in the dataset.
         """
+        logging.info('removing feature %s' % name)
         self.fguide.remove(name)
         self.train.pop(name)
         self.test.pop(name)

@@ -86,6 +86,16 @@ class OrderedSet(collections.MutableSet):
             raise TypeError(
                 "Don't know how to index an OrderedSet by %r" % index)
 
+    @staticmethod
+    def union_all(*sets):
+        union = OrderedSet()
+        union.union(*sets)
+        return union
+
+    def union(self, *sets):
+        for set in sets:
+            self |= set
+
 
 if __name__ == '__main__':
     s = OrderedSet('abracadaba')

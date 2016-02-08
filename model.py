@@ -397,47 +397,24 @@ class ResultsSet(Results):
     """Wrap up several related Results objects for aggregate analysis."""
 
     @staticmethod
-    def validate_result_compatibility(results):
-        """Ensure the iterable of results can be combined into a ResultsSet.
-
-        There are three criteria for this to work. Each must have:
-
-        1.  same predicted column name
-        2.  equivalent feature guides
-        3.  same test data columns and dimensions
-
-        The first Result in the iterable is used as the benchmark and compared
-        to the others.
-
-        Args:
-            results (OrderedDict of Results): To check compatibility of.
-        Raises:
-            ValueError: if there is a mismatch in any of the three necessary
-                criteria for compatibility or the iterable is empty.
-        """
-        # Use the first Result object as the baseline.
+    def _get_first(results):
         try:
-            first_key, first_result = results.iteritems().next()
+            return results.iteritems().next()
         except StopIteration:
             raise ValueError('no results in the iterable')
 
-        # (1) same predicted column name.
-        for key, result in results.iteritems():
-            name = result.predicted.name
-            if name != first_result.predicted.name:
-                raise ValueError(
-                    'Result {} predicted column name "{}" != "{}"'.format(
-                        key, name, first_result.predicted.name))
+    @staticmethod
+    def verify_columns_match(results):
+        """Verify test data for each result has matching columns.
 
-        # (2) equivalent feature guides.
-        first_fguide = first_result.fguide
-        for key, result in results.iteritems():
-            if result.fguide != first_fguide:
-                raise ValueError(
-                    'Result {} feature guide != Result {} feature'
-                    ' guide'.format(key, first_key))
+        Args:
+            results (OrderedDict of Results): To verify columns from.
+        Raises:
+            ValueError: if the iterable is empty or any columns do not match.
+        """
+        # Use the first Result object as the baseline.
+        first_key, first_result = ResultsSet._get_first(results)
 
-        # (3) same dimensions and columns for the test data.
         columns0 = np.sort(first_result.test_data.columns)
         ncols0 = first_result.test_data.shape[1]
         for key, result in results.iteritems():
@@ -459,6 +436,66 @@ class ResultsSet(Results):
                         ' test data columns: {} != {}'.format(
                             key, first_key, columns, columns0))
 
+    @staticmethod
+    def verify_same_predicted_name(results):
+        """Ensure all Results have the same column name for predictions.
+        Args:
+            results (OrderedDict of Results): To check compatibility of.
+        Raises:
+            ValueError: if any predictions do not match.
+        """
+        # Use the first Result object as the baseline.
+        first_key, first_result = ResultsSet._get_first(results)
+
+        # (1) same predicted column name.
+        for key, result in results.iteritems():
+            name = result.predicted.name
+            if name != first_result.predicted.name:
+                raise ValueError(
+                    'Result {} predicted column name "{}" != "{}"'.format(
+                        key, name, first_result.predicted.name))
+
+    @staticmethod
+    def verify_same_feature_guide(results):
+        """Verify the Results have equivalent feature guides.
+        Args:
+            results (OrderedDict of Results): To check compatibility of.
+        Raises:
+            ValueError: if any of the feature guides do not match.
+        """
+        # Use the first Result object as the baseline.
+        first_key, first_result = ResultsSet._get_first(results)
+
+        first_fguide = first_result.fguide
+        for key, result in results.iteritems():
+            if result.fguide != first_fguide:
+                raise ValueError(
+                    'Result {} feature guide != Result {} feature'
+                    ' guide'.format(key, first_key))
+
+    @staticmethod
+    def validate_result_compatibility(results):
+        """Ensure the iterable of results can be combined into a ResultsSet.
+
+        There are three criteria for this to work. Each must have:
+
+        1.  same predicted column name
+        2.  equivalent feature guides
+        3.  same test data columns and dimensions
+
+        The first Result in the iterable is used as the benchmark and compared
+        to the others.
+
+        Args:
+            results (OrderedDict of Results): To check compatibility of.
+        Raises:
+            ValueError: if there is a mismatch in any of the three necessary
+                criteria for compatibility or the iterable is empty.
+        """
+        ResultsSet.verify_same_predicted_name(results)
+        ResultsSet.verify_same_feature_guide(results)
+        ResultsSet.verify_columns_match(results)
+
     def __init__(self, results, col_mismatch='fill'):
         """Initialize the ResultsSet.
 
@@ -479,21 +516,28 @@ class ResultsSet(Results):
             ValueError: if the results are not compatible (see
                 `validate_result_compatibility`).
         """
-        # If the results don't match up, we should fail early, so perform
-        # necessary sanity checks here.
         results = collections.OrderedDict(sorted(results.items()))
         results_list = results.values()
+        result0 = results_list[0]
+
+        # If the results don't match up, we should fail early, so perform
+        # necessary sanity checks here.
         try:
-            self.validate_result_compatibility(results)
-            filled = False
+            self.verify_columns_match(results)
+
+            # no mismatch, can simply use the first feature guide.
+            self.fguide = result0.fguide
+            self.verify_same_feature_guide(results)
         except ColumnMismatchError:
             if col_mismatch == 'raise':
                 raise
 
-            # else fill
-            filled = True
+            # else fill using an outer join, which automatically replaces all
+            # missing columns in any DataFrame with NaN columns.
             test_data_frames = [res.test_data for res in results_list]
             concat = pd.concat(test_data_frames, join='outer')
+
+            # Now pull the individual frames back out.
             start = 0
             for key in results:
                 df = results[key].test_data
@@ -502,18 +546,19 @@ class ResultsSet(Results):
                 results[key].test_data = concat[start:end].copy()
                 start = end
 
-        self.results = results
-        result0 = results_list[0]
-        self._pred_colname = result0.predicted.name
-
-        if filled:  # there was a column mismatch, combine feature guides.
+            # And union all feature guides to get the representative one.
             self.fguide = reduce(
                 lambda fg1, fg2: fg1.union(fg2),
                 [result.fguide for result in results_list])
-            for result in results_list:
-                result.fguide = copy.deepcopy(self.fguide)
-        else:  # no mismatch, can simply use the first feature guide.
-            self.fguide = result0.fguide
+
+        for result in results_list:
+            result.fguide = self.fguide
+
+        self.verify_same_predicted_name(results)
+        self._pred_colname = result0.predicted.name
+
+        # All good, go ahead and set instance variables.
+        self.results = results
 
     def __getitem__(self, key):
         return self.results[key]
@@ -581,8 +626,6 @@ class ResultsSet(Results):
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f)
 
-    # TODO: NaN columns are not being loaded back in; probably has to do with
-    # feature guide.
     @classmethod
     def load(cls, savedir):
         """Load Results from the savedir. Mirrors `ResultsSet.save`.
