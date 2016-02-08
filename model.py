@@ -12,6 +12,7 @@ import logging
 import warnings
 import importlib
 import collections
+import multiprocessing as mp
 
 import numpy as np
 import pandas as pd
@@ -201,6 +202,41 @@ class SklearnModel(Model):
         return self.model.predict(X, **filtered_kwargs)
 
 
+class SklearnModelMP(SklearnModel, mp.Process):
+    """Multiprocessing variant of SklearnModel."""
+
+    def __init__(self, model, split, pipe, *args, **kwargs):
+        """Takes a model, a TrainTestSplit, and a pipe connected to the caller.
+
+        Args:
+            model (sklearn.estimator): A model with the scikit-learn estimator
+                interface. This will be fitted to the training set and used to
+                make predictions on the test set.
+            split (TrainTestSplit): The training and test data.
+            pipe (multiprocessing.Pipe): For communication to the parent
+                process -- to communicate results and learned parameters.
+        """
+        SklearnModel.__init__(self, model)
+        mp.Process.__init__(self, *args, **kwargs)
+        self.split = split
+        self.pipe = pipe
+
+    def run(self):
+        train_X, train_y, train_eids,\
+        test_X, test_y, test_eids, indices, nents = \
+            self.split.preprocess(all_null='drop')
+
+        # Extraneous kwargs are filtered by the fit/predict methods.
+        kwargs = {'entity_ids': train_eids,
+                  'feature_indices': indices,
+                  'n_entities': nents}
+
+        self.fit(train_X, train_y, **kwargs)
+        pred_y = self.predict(test_X, **kwargs)
+        self.pipe.send([pred_y, self.split.test, self.split.fguide, self.model])
+        return 0
+
+
 class SklearnRegressionRunner(object):
 
     def __init__(self, model, splitter):
@@ -256,20 +292,32 @@ class SklearnRegressionRunner(object):
         split = self.splitter[val]
         return self.fit_predict(split, **kwargs)
 
-    def fit_predict_all(self, n_jobs=1, errors='log'):
+    def fit_predict_all(self, errors='log', parallel=True):
         """Run sequential fit/predict loop for all possible data splits in a
         generative manner.
 
-        This should eventually account for:
+        Outstanding TODOs:
 
-        1.  parallel evaluation if using batch methods
-        2.  results not fitting in memory
-        3.  optional reassembly of full data frame with original and predicted
+        1.  results not fitting in memory
+        2.  optional reassembly of full data frame with original and predicted
             results.
 
         Args:
-            n_jobs (int): Number of jobs to use for parallel processing of the
-                multiple TrainTestSplits.
+            parallel (bool): Run the separate splits using multiple processes
+                if True, else just use single main process. True by default.
+            errors (str): see `mldata.TrainTestSplitter.iteritems`.
+        Return: instance of ResultsSet.
+        """
+        if parallel:
+            return self._fit_predict_all_parallel(errors)
+        else:
+            return self._fit_predict_all(errors)
+
+    def _fit_predict_all(self, errors='log'):
+        """Run sequential fit/predict loop for all possible data splits in a
+        generative manner.
+
+        Args:
             errors (str): see `mldata.TrainTestSplitter.iteritems`.
         Return: instance of ResultsSet.
         """
@@ -277,6 +325,25 @@ class SklearnRegressionRunner(object):
         for val, split in self.splitter.iteritems(errors):
             logging.info('fit/predict for split {}'.format(val))
             results[val] = self.fit_predict(split)
+
+        return RegressionResultsSet(results)
+
+    def _fit_predict_all_parallel(self, errors='log'):
+        """Parallel variant of fit_predict_all."""
+        results = {}
+        for key, split in self.splitter.iteritems(errors):
+            parent_conn, child_conn = mp.Pipe()
+            proc = SklearnModelMP(self.model.clone().model, split, child_conn)
+            results[key] = (proc, parent_conn)
+
+            logging.info(
+                'starting process for fit/predict on split {}'.format(key))
+            proc.start()
+
+        for key, (proc, conn) in results.items():
+            pred_y, test, fguide, inner_model = conn.recv()
+            model = SklearnModel(inner_model)
+            results[key] = RegressionResults(pred_y, test, fguide, model)
 
         return RegressionResultsSet(results)
 
