@@ -3,6 +3,7 @@ Model and Results classes for encapsualting ML method train and predict logic
 as well as prediction evaluation logic.
 """
 import os
+import abc
 import copy
 import json
 import pydoc
@@ -277,11 +278,44 @@ class SklearnRegressionRunner(object):
             logging.info('fit/predict for split {}'.format(val))
             results[val] = self.fit_predict(split)
 
-        # TODO: return RegressionResultsSet instead.
-        return ResultsSet(results)
+        return RegressionResultsSet(results)
 
 
-class Results(object):
+class abstractclassmethod(classmethod):
+
+    __isabstractmethod__ = True
+
+    def __init__(self, callable):
+        callable.__isabstractmethod__ = True
+        super(abstractclassmethod, self).__init__(callable)
+
+class ResultsBase(object):
+    """Abstract base class for prediction results on a TrainTestSplit."""
+
+    __metaclass__ = abc.ABCMeta
+
+    @abc.abstractproperty
+    def predicted(self):
+        pass
+
+    @abc.abstractproperty
+    def actual(self):
+        pass
+
+    @abc.abstractproperty
+    def model_params(self):
+        pass
+
+    @abc.abstractmethod
+    def save(self, savedir, ow=False):
+        pass
+
+    @abstractclassmethod
+    def load(self, savedir):
+        pass
+
+
+class Results(ResultsBase):
     """Encapsulate model prediction results & metadata for evaluation."""
 
     _predicted_suffix = '_predicted'
@@ -367,6 +401,17 @@ class Results(object):
         return cls(predicted, test_data, fguide, model)
 
 
+# Define regression metrics that take an array of errors.
+def error_rmse(arr):
+    return np.sqrt((arr ** 2).sum() / len(arr))
+
+def error_mae(arr):
+    return abs(arr).sum() / len(arr)
+
+def error_mae_std(arr):
+    return abs(arr).std()
+
+
 class RegressionResults(Results):
     """Encapsulate model regression predictions & metadata for evaluation."""
 
@@ -388,12 +433,31 @@ class RegressionResults(Results):
     def mae(self):
         return abs(self.error()).mean()
 
+    def evaluate_by(self, colname,
+                    metrics=[error_rmse, error_mae, error_mae_std, len]):
+        """Evaluate the results in terms of (grouping by) a particular column.
+
+        Args:
+            colname (str): Name of column to evaluate by.
+            metrics (iterable): Metrics to apply to the grouped error.
+        Return:
+            eval (DataFream): An evaluation of the results by the given column
+                name, including various metrics: RMSE, MAE, MAE std, counts.
+        """
+        errname = '__error__'
+        test_data = self.test_data
+        test_data.loc[:, errname] = self.error()
+        evaluation = test_data.groupby(colname)[errname].aggregate(metrics)
+        evaluation = pd.concat((evaluation, \
+            test_data.groupby(lambda i: 'all')[errname].agg(metrics)))
+        return evaluation
+
 
 class ColumnMismatchError(Exception):
     """Raise when aggregating DataFrame objects with mismatched columns."""
     pass
 
-class ResultsSet(Results):
+class ResultsSet(ResultsBase):
     """Wrap up several related Results objects for aggregate analysis."""
 
     @staticmethod
@@ -664,3 +728,9 @@ class ResultsSet(Results):
                     for path in subdir_paths]
         results = collections.OrderedDict(sorted(contents))
         return cls(results)
+
+
+class RegressionResultsSet(ResultsSet, RegressionResults):
+    """A ResultsSet with evaluation metrics for regression predictions."""
+    pass
+
