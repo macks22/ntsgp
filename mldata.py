@@ -198,7 +198,7 @@ class FeatureGuide(object):
 
     @property
     def feature_names(self):
-        return list(reduce(
+        return list(reduce(  # Intersection of all feature section names.
                 lambda s1, s2: s1 | s2,
                 [getattr(self, attr) for attr in self.feature_sections]))
 
@@ -351,11 +351,16 @@ class PandasDataset(Dataset):
 
         Args:
             fname (str): Name of the file to read the DataFrame from.
-            fguide (FeatureGuide): The feature guide to extract the index and
-                the list of columns from.
+            fguide {FeatureGuide | str}: The feature guide to extract the index
+                and the list of columns from. This can also be a string, in
+                which case it is interpreted as the name of a file, in which
+                case we attempt to instantiate a `FeatureGuide` from it.
         Return:
             df (pd.DataFrame): DataFrame read from the file.
         """
+        if isinstance(fguide, basestring):
+            fguide = FeatureGuide(fguide)
+
         kwargs = {
             'index_col': PandasDataset.index_from_feature_guide(fguide),
             'usecols': fguide.all_names
@@ -381,6 +386,13 @@ class PandasDataset(Dataset):
         index_col = PandasDataset.index_from_feature_guide(fguide)
         kwargs = {'index': index_col is not None}
         df.to_csv(fname, **kwargs)
+
+    def map_column_to_index(self, entity):
+        raise NotImplementedError
+
+    def make_entities_contiguous(self):
+        for entity in self.fguide.entities:
+            self.map_column_to_index(entity)
 
 
 class PandasFullDataset(PandasDataset):
@@ -420,9 +432,14 @@ class PandasFullDataset(PandasDataset):
         instance). This method changes the ids in place, producing an (new_id,
         orig_id) dict which is stored in the `column_maps` instance variable.
 
+        This operation is idempotent.
+
         Args:
             key (str): Column name with ids to map.
         """
+        if col in self.column_maps:
+            return
+
         # First construct the map from original ids to new ones.
         ids = self.dataset[col].unique()
         n = len(ids)
@@ -432,7 +449,22 @@ class PandasFullDataset(PandasDataset):
         self.dataset[col] = self.dataset[col].apply(lambda _id: idmap[_id])
 
         # Now swap key for value in the idmap to provide a way to convert back.
-        self.column_maps[col] = {val: key for key, val in idmap.iteritems()}
+        reverse_map = {val: key for key, val in idmap.iteritems()}
+        self.column_maps[col] = reverse_map
+
+    def unmap_column_from_index(self, col, not_mapped='raise'):
+        try:
+            reverse_map = self.column_maps[col]
+        except KeyError:
+            if not_mapped == 'raise':
+                raise ValueError('column %s was not mapped to an index' % col)
+            elif not_mapped == 'warn':
+                # TODO: implement warning
+                pass
+
+        self.dataset[col] = self.dataset[col].apply(
+            lambda _id: reverse_map[_id])
+        del self.column_maps[col]
 
     def remove_feature(self, name):
         """Remove the given feature from the feature guide and then from the
@@ -812,6 +844,9 @@ class PandasTrainTestSplit(PandasDataset):
         Args:
             key (str): Column name with ids to map.
         """
+        if col in self.column_maps:
+            return
+
         # First construct the map from original ids to new ones.
         ids = pd.concat((self.train[col], self.test[col])).unique()
         n = len(ids)
@@ -822,7 +857,29 @@ class PandasTrainTestSplit(PandasDataset):
         self.test.loc[:, col] = self.test[col].apply(lambda _id: idmap[_id])
 
         # Now swap key for value in the idmap to provide a way to convert back.
-        self.column_maps[col] = {val: key for key, val in idmap.iteritems()}
+        reverse_map = {val: key for key, val in idmap.iteritems()}
+        self.column_maps[col] = reverse_map
+
+    def unmap_column_from_index(self, col, not_mapped='raise'):
+        try:
+            reverse_map = self.column_maps[col]
+        except KeyError:
+            if not_mapped == 'raise':
+                raise ValueError('column %s was not mapped to an index' % col)
+            elif not_mapped == 'warn':
+                # TODO: implement warning
+                pass
+
+        # Next use map to convert back to original ids in-place.
+        self.train.loc[:, col] = self.train[col].apply(
+            lambda _id: reverse_map[_id])
+        self.test.loc[:, col] = self.test[col].apply(
+            lambda _id: reverse_map[_id])
+        self.dataset[col] = self.dataset[col].apply(
+            lambda _id: reverse_map[_id])
+
+        # Finally, remove the reverse id map from the dict of column maps.
+        del self.column_maps[col]
 
     def remove_feature(self, name):
         """Remove the given feature from the feature guide and then from the
@@ -981,8 +1038,71 @@ class PandasTrainTestSplit(PandasDataset):
         if self.fguide.real_valueds:
             self.unscale(self.fguide.real_valueds)
 
-    def preprocess(self, impute=True, all_null='raise'):
+    def one_hot_encode(self, columns):
+        """One-hot encode the given columns of the train and test data. The
+        encoded features are returned as two `scipy.sparse.csr_matrix`
+        instances: one for the train set and one for the test set. The indices
+        are sorted such that the encoded columns appear in the same relative
+        order as in `columns`. A mapping from the column names to the encoded
+        features is also returned. The features for columns[i] are present in
+        encoded[fmap[i]:fmap[i+1]].
+
+        Returns:
+            train_enc (csr_matrix): Sparse matrix with one-hot encoded columns
+                from the training dataset.
+            test_enc (csr_matrix): Sparse matrix with one-hot encoded columns
+                from the testing dataset.
+            fmap (list): Map from the column names to the column indices in the
+                sparse matrix where the encoded features for that column are
+                present.
+            encoder (OneHotEncoder): Encoder used to encode the data.
+        """
+        if not columns:
+            return None
+
+        both_sets = pd.concat((self.train[columns], self.test[columns]))
+        encoder = preprocessing.OneHotEncoder()
+        encoded = encoder.fit_transform(both_sets).sorted_indices()
+
+        # Split apart train and test set arrays after one-hot encoding.
+        nd_train = self.train.shape[0]
+        train_enc = encoded[:nd_train]
+        test_enc = encoded[nd_train:]
+
+        # Create a feature map for decoding one-hot encoding.
+        counts = np.array([both_sets[col].unique().shape[0] for col in columns])
+        fmap = zip(columns, np.cumsum(counts))
+
+        logging.info('after one-hot encoding, found # unique values:')
+        for attr, n_values in zip(columns, counts):
+            logging.info('%s: %d' % (attr, n_values))
+
+        return train_enc, test_enc, fmap, encoder
+
+    def preprocess(self, impute=True, all_null='raise', normalize=True,
+                   use_ents=True, ohc_ents=True, use_cats=True, ohc_cats=True):
         """Return preprocessed (X, y, eid) pairs for the train and test sets.
+
+        Args:
+            impute (bool): Impute missing values for real-valued features.
+            all_null (str): See `impute` method.
+            normalize (bool): Whether or not real-valued features should be
+                normalized. If so, use Z-score scaling to do so. True by
+                default.
+            use_cats (bool): Whether or not to use categorical features. If False,
+                they will not be included in the feature vectors. If True and
+                `ohc_cats` is True, they will be included as one-hot-encoded
+                features. If True and `ohc_cats` is False, they will be
+                included, one per column, without any further preprocessing.
+            ohc_cats (bool): Whether or not to one-hot encode categorical
+                features. True by default. Ignored if `use_cats` is False.
+            use_ents (bool): Whether or not to use entity features. If False,
+                they will not be included in the feature vectors. If True and
+                `ohc_ents` is True, they will be included as one-hot-encoded
+                features. If True and `ohc_ents` is False, they will simply be
+                mapped to a 0-contiguous range and included, one per column.
+            ohc_ents (bool): Whether or not to one-hot encode entity features.
+                True by default. If `use_ents` is False, this will be ignored.
 
         Preprocessing includes:
 
@@ -1005,8 +1125,8 @@ class PandasTrainTestSplit(PandasDataset):
         8.  nents: The number of unique entities for each entity.
 
         """
-        train_eids = {}
-        test_eids = {}
+        train_eids = pd.DataFrame()
+        test_eids = pd.DataFrame()
         for entity in self.fguide.entities:
             self.map_column_to_index(entity)
             train_eids[entity] = self.train[entity].values
@@ -1014,72 +1134,84 @@ class PandasTrainTestSplit(PandasDataset):
 
         # Z-score scaling of real-valued features.
         self.impute_reals(all_null=all_null)
-        self.scale_reals()
-        nreal = len(self.fguide.real_valueds)
+        if normalize:
+            self.scale_reals()
+        # TODO: if already normalized, normalize=False will have no effect.
 
-        # One-hot encoding of entity and categorical features.
-        cats_and_ents = list(self.fguide.entities | self.fguide.categoricals)
-        all_cats = pd.concat((self.train[cats_and_ents],
-                              self.test[cats_and_ents]))
-        encoder = preprocessing.OneHotEncoder()
-        encoded_cats = encoder.fit_transform(all_cats)
+        # One-hot encoding of categorical and possibly entity features.
+        to_ohc = OrderedSet()
+        if use_ents and ohc_ents:
+            to_ohc |= self.fguide.entities
+        to_ohc |= self.fguide.categoricals
+        # TODO: implement use_cats and ohc_cats args.
+        # if use_cats and ohc_cats:
+        #     to_ohc |= self.fguide.categoricals
 
-        # Split apart train and test set arrays after one-hot encoding.
-        nd_train = self.train.shape[0]
-        train_enc_cats = encoded_cats[:nd_train]
-        test_enc_cats = encoded_cats[nd_train:]
+        to_ohc = list(to_ohc)
+        if to_ohc:
+            train_enc_cats, test_enc_cats, fmap, encoder = \
+                self.one_hot_encode(to_ohc)
+            n_ohc_total = sum(encoder.n_values_)
+            nf_ohc = encoder.active_features_.shape[0]
+        else:
+            # TODO: implement use_cats and ohc_cats args.
+            n_ohc_total = 0
+            nf_ohc = 0
 
-        # Create a feature map for decoding one-hot encoding.
-        ncats_and_ents = encoder.active_features_.shape[0]
-        nf = ncats_and_ents + nreal
+        # Update feature matrices to include entities if they were not included
+        # in the one-hot encoding.
+        # Also update the feature map while we're at it.
+        n_ents = len(self.fguide.entities)
+        if use_ents:
+            if ohc_ents:  # already included in feature map
+                nf_ents = dict(fmap)[self.fguide.entities[-1]]
+                n_ents_total = sum(encoder.n_values_[i] for i in range(n_ents))
+                n_cats_total = n_ohc_total - n_ents_total
+            else:  # need to update feature map
+                nf_ents = n_ents
+                n_ents_total = n_ents
+                n_cats_total = n_ohc_total
 
-        # Count entities.
-        logging.info('after one-hot encoding, found # unique values:')
-        counts = np.array([
-            all_cats[cats_and_ents[i]].unique().shape[0]
-            for i in range(len(cats_and_ents))
-        ])
+                # Add n_ents to all categorical features in feature map.
+                fmap = [(col, idx + n_ents) for col, idx in fmap]
 
-        # Assemble map to new feature indices using counts.
-        indices = zip(cats_and_ents, np.cumsum(counts))
-        for attr, n_values in zip(self.fguide.entities, counts):
-            logging.info('%s: %d' % (attr, n_values))
+                ent_fmap = zip(self.fguide.entities, range(n_ents))
+                fmap = ent_fmap + fmap
 
-        # Add in real-valued feature indices.
-        last_cat_index = indices[-1][1]
-        indices += zip(self.fguide.real_valueds,
-                       range(last_cat_index + 1, nf + 1))
+                # Add entities onto the beginning of the feature matrices.
+                labels = list(self.fguide.entities)
+                train_enc_cats = sp.sparse.hstack((
+                    self.train[labels].values, train_enc_cats))
+                test_enc_cats = sp.sparse.hstack((
+                    self.test[labels].values, test_enc_cats))
 
-        # How many entity and categorical features do we have now?
-        nents = dict(indices)[self.fguide.entities[-1]]
-        ncats = ncats_and_ents - nents
-        nf = ncats_and_ents + nreal
+        # How many features of each type do we have after one-hot-encoding?
+        nf_cats = nf_ohc - nf_ents
+        nf_real = len(self.fguide.real_valueds)
+        nf = nf_ents + nf_cats + nf_real
 
-        n_ent_names = len(self.fguide.entities)
-        ent_idx = range(n_ent_names)
-        cat_idx = range(n_ent_names, len(cats_and_ents))
-        nactive_ents = sum(encoder.n_values_[i] for i in ent_idx)
-        nactive_cats = sum(encoder.n_values_[i] for i in cat_idx)
+        # Add in the real-valued features.
+        next_available_index = fmap[-1][1] + 1
+        real_indices = range(next_available_index, nf + 1)
+        fmap += zip(self.fguide.real_valueds, real_indices)
 
+        train_X = sp.sparse.hstack((train_enc_cats, self.train_reals.values))
+        test_X = sp.sparse.hstack((test_enc_cats, self.test_reals.values))
+
+        # Log information regarding encoded features.
         logging.info('number of active entity features: %d of %d' % (
-            nents, nactive_ents))
+            nf_ents, n_ents_total))
         logging.info('number of active categorical features: %d of %d' % (
-            ncats, nactive_cats))
-        logging.info('number of real-valued features: %d' % nreal)
+            nf_cats, n_cats_total))
+        logging.info('number of real-valued features: %d' % nf_real)
         logging.info('Total of %d features after encoding' % nf)
-
-        # Put all features together.
-        train_X = sp.sparse.hstack((
-            train_enc_cats, self.train_reals.values))
-        test_X = sp.sparse.hstack((
-            test_enc_cats, self.test_reals.values))
 
         train_y = self.train_target.values
         test_y = self.test_target.values
 
         return (train_X.tocsr(), train_y, train_eids,
                 test_X.tocsr(), test_y, test_eids,
-                indices, nents)
+                fmap, nf_ents)
 
 
 # Add properties to PandasTrainTestSplit for quick feature section access.
