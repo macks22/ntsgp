@@ -703,7 +703,7 @@ class PandasFullDataset(PandasDataset):
 class PandasDatasetSplitter(object):
     """Iterator for all possible train/test splits using given col & ops."""
 
-    def __init__(self, dataset, colname, train_cmp, test_cmp):
+    def __init__(self, dataset, colname, train_cmp, test_cmp, cold_start=False):
         """
         Args:
             dataset (PandasFullDataset): The dataset to produce
@@ -714,6 +714,8 @@ class PandasDatasetSplitter(object):
                 getting the subset to be used for training data.
             test_cmp (function): Comparison function to use for
                 getting the subset to be used for testing data.
+            cold_start (bool): Whether or not to include cold-start records in
+                the test set.
         """
         self.dataset = dataset
         self.colname = colname
@@ -1079,8 +1081,22 @@ class PandasTrainTestSplit(PandasDataset):
 
         return train_enc, test_enc, fmap, encoder
 
+    def remove_cold_start(self, entities=None):
+        """Remove any records from the test set that have entities which do not
+        appear in the training set. Optionally pass a list of entities to remove
+        cold-start records for.
+        """
+        entities = self.fguide.entities if entities is None else entities
+        for key in entities:
+            diff = np.setdiff1d(self.test[key], self.train[key])
+            logging.info(
+                'removing %d %s ids from the test set.' % (len(diff), key))
+            logging.debug(' '.join(map(str, diff)))
+            self.test = self.test[~self.test[key].isin(diff)]
+
     def preprocess(self, impute=True, all_null='raise', normalize=True,
-                   use_ents=True, ohc_ents=True, use_cats=True, ohc_cats=True):
+                   use_ents=True, ohc_ents=True, use_cats=True, ohc_cats=True,
+                   remove_cold_start=True):
         """Return preprocessed (X, y, eid) pairs for the train and test sets.
 
         Args:
@@ -1103,6 +1119,10 @@ class PandasTrainTestSplit(PandasDataset):
                 mapped to a 0-contiguous range and included, one per column.
             ohc_ents (bool): Whether or not to one-hot encode entity features.
                 True by default. If `use_ents` is False, this will be ignored.
+            remove_cold_start {bool | iterable}: If True, remove cold start for
+                all entities in the feature guide. If an iterable, remove cold
+                start for only the entities in the iterable. Any extraneous
+                column names that are not entities will raise a KeyError.
 
         Preprocessing includes:
 
@@ -1125,6 +1145,13 @@ class PandasTrainTestSplit(PandasDataset):
         8.  nents: The number of unique entities for each entity.
 
         """
+        try:
+            iter(remove_cold_start)
+            self.remove_cold_start(remove_cold_start)
+        except TypeError:
+            if remove_cold_start:
+                self.remove_cold_start()
+
         train_eids = pd.DataFrame()
         test_eids = pd.DataFrame()
         for entity in self.fguide.entities:
@@ -1184,6 +1211,10 @@ class PandasTrainTestSplit(PandasDataset):
                     self.train[labels].values, train_enc_cats))
                 test_enc_cats = sp.sparse.hstack((
                     self.test[labels].values, test_enc_cats))
+        else:  # not using ents
+            nf_ents = 0
+            n_ents_total = 0
+            n_cats_total = n_ohc_total
 
         # How many features of each type do we have after one-hot-encoding?
         nf_cats = nf_ohc - nf_ents

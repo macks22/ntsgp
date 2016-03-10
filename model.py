@@ -26,7 +26,7 @@ class Model(object):
     """Encapsulate model with known API for TrainTestSplit use."""
 
     def __init__(self, model, normalize=True, use_cats=True, ohc_cats=True,
-                 use_ents=True, ohc_ents=True):
+                 use_ents=True, ohc_ents=True, remove_cold_start=True):
         """Take the model and several arguments that specify which preprocessing
         steps should be used for this model. The model should be an sklearn
         compliant estimator. For the rest of the arguments, see
@@ -38,11 +38,13 @@ class Model(object):
         self.ohc_cats = ohc_cats
         self.use_ents = use_ents
         self.ohc_ents = ohc_ents
+        self.remove_cold_start = remove_cold_start
 
     @property
     def preprocess_args(self):
         return {name: getattr(self, name) for name in
-                ('normalize', 'use_cats', 'ohc_cats', 'use_ents', 'ohc_ents')}
+                ('normalize', 'use_cats', 'ohc_cats', 'use_ents', 'ohc_ents',
+                 'remove_cold_start')}
 
     @property
     def model_name(self):
@@ -291,12 +293,12 @@ class SklearnRegressionRunner(object):
             split.preprocess(all_null='drop', **model.preprocess_args)
 
         # Extraneous kwargs are filtered by the fit/predict methods.
-        kwargs = {'entity_ids': train_eids,
+        kwargs = {'entity_ids': train_eids.values,
                   'feature_indices': fmap,
                   'n_entities': nents}
         model.fit(train_X, train_y, **kwargs)
 
-        kwargs['entity_ids'] = test_eids
+        kwargs['entity_ids'] = test_eids.values
         pred_y = model.predict(test_X, **kwargs)
         return RegressionResults(pred_y, split.test, split.fguide, model)
 
