@@ -25,8 +25,24 @@ import saveload
 class Model(object):
     """Encapsulate model with known API for TrainTestSplit use."""
 
-    def __init__(self, model):
+    def __init__(self, model, normalize=True, use_cats=True, ohc_cats=True,
+                 use_ents=True, ohc_ents=True):
+        """Take the model and several arguments that specify which preprocessing
+        steps should be used for this model. The model should be an sklearn
+        compliant estimator. For the rest of the arguments, see
+        `PandasTrainTestSplit.preprocess`.
+        """
         self.model = model
+        self.normalize = normalize
+        self.use_cats = use_cats
+        self.ohc_cats = ohc_cats
+        self.use_ents = use_ents
+        self.ohc_ents = ohc_ents
+
+    @property
+    def preprocess_args(self):
+        return {name: getattr(self, name) for name in
+                ('normalize', 'use_cats', 'ohc_cats', 'use_ents', 'ohc_ents')}
 
     @property
     def model_name(self):
@@ -189,8 +205,9 @@ class SklearnModel(Model):
         """Fit the model. This method uses introspection to determine which
         keyword arguments are accepted and only passes those through.
         """
-        filtered_kwargs = key_intersect(kwargs, self.fit_kwargs)
-        self.model.fit(X, y, **filtered_kwargs)
+        accepted = self.fit_kwargs + self.fit_pargs
+        filtered_kwargs = key_intersect(kwargs, accepted)
+        self.model.fit(X, np.squeeze(y), **filtered_kwargs)
         return self
 
     def predict(self, X, **kwargs):
@@ -198,7 +215,8 @@ class SklearnModel(Model):
         uses introspection to determine which keyword arguments are accepted
         and only passes those through.
         """
-        filtered_kwargs = key_intersect(kwargs, self.predict_kwargs)
+        accepted = self.predict_kwargs + self.predict_pargs
+        filtered_kwargs = key_intersect(kwargs, accepted)
         return self.model.predict(X, **filtered_kwargs)
 
 
@@ -222,9 +240,12 @@ class SklearnModelMP(SklearnModel, mp.Process):
         self.pipe = pipe
 
     def run(self):
+        # Create copy of model with same params.
+        model = self.model.clone()
+
         train_X, train_y, train_eids,\
-        test_X, test_y, test_eids, indices, nents = \
-            self.split.preprocess(all_null='drop')
+        test_X, test_y, test_eids, fmap, nents = \
+            split.preprocess(all_null='drop', **model.preprocess_args)
 
         # Extraneous kwargs are filtered by the fit/predict methods.
         kwargs = {'entity_ids': train_eids,
@@ -233,7 +254,7 @@ class SklearnModelMP(SklearnModel, mp.Process):
 
         self.fit(train_X, train_y, **kwargs)
         pred_y = self.predict(test_X, **kwargs)
-        self.pipe.send([pred_y, self.split.test, self.split.fguide, self.model])
+        self.pipe.send([pred_y, self.split.test, self.split.fguide, model])
         return 0
 
 
@@ -262,18 +283,20 @@ class SklearnRegressionRunner(object):
                 the test data.
         Return: instance of ResultsSet.
         """
-        train_X, train_y, train_eids,\
-        test_X, test_y, test_eids, indices, nents = \
-            split.preprocess(all_null='drop')
-
         # Create copy of model with same params.
         model = self.model.clone()
 
+        train_X, train_y, train_eids,\
+        test_X, test_y, test_eids, fmap, nents = \
+            split.preprocess(all_null='drop', **model.preprocess_args)
+
         # Extraneous kwargs are filtered by the fit/predict methods.
         kwargs = {'entity_ids': train_eids,
-                  'feature_indices': indices,
+                  'feature_indices': fmap,
                   'n_entities': nents}
         model.fit(train_X, train_y, **kwargs)
+
+        kwargs['entity_ids'] = test_eids
         pred_y = model.predict(test_X, **kwargs)
         return RegressionResults(pred_y, split.test, split.fguide, model)
 
@@ -290,7 +313,7 @@ class SklearnRegressionRunner(object):
         Return: instance of ResultsSet.
         """
         split = self.splitter[val]
-        return self.fit_predict(split, **kwargs)
+        return self.fit_predict(split)
 
     def fit_predict_all(self, errors='log', parallel=True):
         """Run sequential fit/predict loop for all possible data splits in a
@@ -355,6 +378,7 @@ class abstractclassmethod(classmethod):
     def __init__(self, callable):
         callable.__isabstractmethod__ = True
         super(abstractclassmethod, self).__init__(callable)
+
 
 class ResultsBase(object):
     """Abstract base class for prediction results on a TrainTestSplit."""
@@ -682,6 +706,8 @@ class ResultsSet(ResultsBase):
                 lambda fg1, fg2: fg1.union(fg2),
                 [result.fguide for result in results_list])
 
+        # Assign all individual results to have same, shared representative
+        # feature guide.
         for result in results_list:
             result.fguide = self.fguide
 
