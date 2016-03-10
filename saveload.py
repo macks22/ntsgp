@@ -3,11 +3,19 @@ Functionality for saving and loading model parameters, results, data, etc.
 
 """
 import os
+import time
 import json
 import shutil
 import logging
+import datetime
 
 import numpy as np
+
+
+def gen_ts():
+    ts = time.time()
+    st = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d-%H-%M-%S')
+    return st
 
 
 def ow_dir_if_exists(dirname):
