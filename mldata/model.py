@@ -74,7 +74,7 @@ class Model(object):
         model_class = getattr(model_module, self.model_name)
         inner_model = model_class(**self.fixed_params)
 
-        model = self.__class__(inner_model)
+        model = self.__class__(inner_model, **self.preprocess_args)
         for learned_param, val in self.learned_params.items():
             setattr(model, learned_param, val)
         return model
