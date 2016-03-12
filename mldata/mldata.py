@@ -1235,8 +1235,8 @@ class PandasTrainTestSplit(PandasDataset):
         logging.info('number of real-valued features: %d' % nf_real)
         logging.info('Total of %d features after encoding' % nf)
 
-        train_y = self.train_target.values
-        test_y = self.test_target.values
+        train_y = np.squeeze(self.train_target.values)
+        test_y = np.squeeze(self.test_target.values)
 
         return (train_X.tocsr(), train_y, train_eids,
                 test_X.tocsr(), test_y, test_eids,
