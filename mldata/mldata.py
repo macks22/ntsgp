@@ -1145,12 +1145,10 @@ class PandasTrainTestSplit(PandasDataset):
         8.  nents: The number of unique entities for each entity.
 
         """
-        try:
-            iter(remove_cold_start)
+        if remove_cold_start == True:
+            self.remove_cold_start()
+        elif remove_cold_start:
             self.remove_cold_start(remove_cold_start)
-        except TypeError:
-            if remove_cold_start:
-                self.remove_cold_start()
 
         train_eids = pd.DataFrame()
         test_eids = pd.DataFrame()
