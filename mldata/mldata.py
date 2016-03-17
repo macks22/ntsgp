@@ -696,14 +696,14 @@ class PandasFullDataset(PandasDataset):
         test = self.dataset.loc[test_mask]
         return PandasTrainTestSplit.from_dfs(train, test, self.fguide)
 
-    def split_loop(self, col, train_cmp, test_cmp):
-        return PandasDatasetSplitter(self, col, train_cmp, test_cmp)
+    def split_loop(self, col, train_cmp, test_cmp, window=None):
+        return PandasDatasetSplitter(self, col, train_cmp, test_cmp, window=None)
 
 
 class PandasDatasetSplitter(object):
     """Iterator for all possible train/test splits using given col & ops."""
 
-    def __init__(self, dataset, colname, train_cmp, test_cmp, cold_start=False):
+    def __init__(self, dataset, colname, train_cmp, test_cmp, window=None):
         """
         Args:
             dataset (PandasFullDataset): The dataset to produce
@@ -714,13 +714,14 @@ class PandasDatasetSplitter(object):
                 getting the subset to be used for training data.
             test_cmp (function): Comparison function to use for
                 getting the subset to be used for testing data.
-            cold_start (bool): Whether or not to include cold-start records in
-                the test set.
+            window (int): Limit on number of previous units to include in the
+                training set. None by default.
         """
         self.dataset = dataset
         self.colname = colname
         self.train_cmp = train_cmp
         self.test_cmp = test_cmp
+        self.window = window
 
     @property
     def column(self):
@@ -736,9 +737,14 @@ class PandasDatasetSplitter(object):
 
     def __iter__(self):
         column = self.column
+        global_min_val = min(self.unique_values)
         for val in self.unique_values:
-            yield self.dataset.split(
-                self.train_cmp(column, val), self.test_cmp(column, val))
+            min_val = (global_min_val if self.window is None else
+                       val - self.window)
+            constraint = column >= min_val
+            train_mask = self.train_cmp(column, val) & constraint
+            test_mask = self.test_cmp(column, val)
+            yield self.dataset.split(train_mask, test_mask)
 
     def iteritems(self, errors='log'):
         """Iterate over all possible splits, returning each in a tuple with its
