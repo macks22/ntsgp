@@ -12,6 +12,7 @@ import logging
 import warnings
 import importlib
 import collections
+import cPickle as pickle
 import multiprocessing as mp
 
 import numpy as np
@@ -242,21 +243,19 @@ class SklearnModelMP(SklearnModel, mp.Process):
         self.pipe = pipe
 
     def run(self):
-        # Create copy of model with same params.
-        model = self.model.clone()
-
         train_X, train_y, train_eids,\
         test_X, test_y, test_eids, fmap, nents = \
-            split.preprocess(all_null='drop', **model.preprocess_args)
+            self.split.preprocess(all_null='drop', **self.preprocess_args)
 
         # Extraneous kwargs are filtered by the fit/predict methods.
-        kwargs = {'entity_ids': train_eids,
-                  'feature_indices': indices,
+        kwargs = {'entity_ids': train_eids.values,
+                  'feature_indices': fmap,
                   'n_entities': nents}
 
         self.fit(train_X, train_y, **kwargs)
+        kwargs['entity_ids'] = test_eids.values
         pred_y = self.predict(test_X, **kwargs)
-        self.pipe.send([pred_y, self.split.test, self.split.fguide, model])
+        self.pipe.send([pred_y, self.split.test, self.split.fguide, self.model])
         return 0
 
 
@@ -829,3 +828,68 @@ class RegressionResultsSet(ResultsSet, RegressionResults):
     """A ResultsSet with evaluation metrics for regression predictions."""
     pass
 
+
+class PmixorModelMP(SklearnModelMP):
+
+    def run(self):
+        train_X, train_y, train_eids,\
+        test_X, test_y, test_eids, fmap, nents = \
+            self.split.preprocess(all_null='drop', **self.preprocess_args)
+
+        # Extraneous kwargs are filtered by the fit/predict methods.
+        kwargs = {'entity_ids': train_eids.values,
+                  'feature_indices': fmap,
+                  'n_entities': nents}
+
+        self.fit(train_X, train_y, **kwargs)
+        kwargs['entity_ids'] = test_eids.values
+        kwargs['interval'] = 'hpd'
+        pred_y, lower, upper = self.predict(test_X, **kwargs)
+        self.pipe.send([pred_y, lower, upper, self.split.test,
+                        self.split.fguide, self.model])
+        return 0
+
+
+class PmixorResults(RegressionResults):
+
+    def __init__(self, predicted, lower, upper, test_data, fguide, model):
+        self.fguide = fguide
+        self._pred_colname = '%s%s' % (fguide.target, self._predicted_suffix)
+        self.test_data = test_data
+        self.test_data.loc[:, self._pred_colname] = predicted
+        self.test_data.loc[:, 'lower'] = lower
+        self.test_data.loc[:, 'upper'] = upper
+        self.model = model
+
+
+class PmixorResultsSet(RegressionResultsSet):
+
+    def save(self, fname):
+        with open(fname, 'w') as f:
+            pickle.dump(self, f, -1)
+
+    @classmethod
+    def load(cls, fname):
+        with open(fname) as f:
+            return pickle.load(f)
+
+class PmixorRunner(SklearnRegressionRunner):
+
+    def _fit_predict_all_parallel(self, errors='log'):
+        """Parallel variant of fit_predict_all."""
+        results = {}
+        for key, split in self.splitter.iteritems(errors):
+            parent_conn, child_conn = mp.Pipe()
+            proc = PmixorModelMP(self.model.clone().model, split, child_conn)
+            results[key] = (proc, parent_conn)
+
+            logging.info(
+                'starting process for fit/predict on split {}'.format(key))
+            proc.start()
+
+        for key, (proc, conn) in results.items():
+            pred_y, lower, upper, test, fguide, inner_model = conn.recv()
+            model = SklearnModel(inner_model)
+            results[key] = PmixorResults(pred_y, lower, upper, test, fguide, model)
+
+        return PmixorResultsSet(results)

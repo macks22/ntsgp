@@ -158,7 +158,12 @@ def load_model_vars(savedir):
         var_file = os.path.join(savedir, fname)
         with open(var_file) as f:
             dtype_str, data = f.read().strip().split(',')
-            dtype = eval(dtype_str)
+            try:
+                dtype = eval(dtype_str)
+            except NameError:  # not a builtin
+                logging.error('unable to load var %s of type %s' % (
+                    name, dtype_str))
+                continue
             if dtype == bool:
                 vars[name] = True if data == 'True' else False
             else:

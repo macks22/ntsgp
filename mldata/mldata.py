@@ -42,9 +42,9 @@ class FeatureGuide(object):
     feature_sections = tuple(set(sections) - set(other_sections))
 
     # We use slots here not so much for efficiency as for documentation.
-    __slots__ = [field_name for field_name in sections]
-    __slots__.append('fname')
-    __slots__.append('comments')
+    __slots = [field_name for field_name in sections]
+    __slots.append('fname')
+    __slots.append('comments')
 
     @classmethod
     def parse_config(cls, fname):
