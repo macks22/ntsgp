@@ -1188,11 +1188,11 @@ class PandasTrainTestSplit(PandasDataset):
             # TODO: implement use_cats and ohc_cats args.
             n_ohc_total = 0
             nf_ohc = 0
+            fmap = []
 
         # Update feature matrices to include entities if they were not included
         # in the one-hot encoding.
         # Also update the feature map while we're at it.
-        fmap = []
         n_ents = len(self.fguide.entities)
         if use_ents:
             if ohc_ents:  # already included in feature map
