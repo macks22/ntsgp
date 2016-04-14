@@ -1192,6 +1192,7 @@ class PandasTrainTestSplit(PandasDataset):
         # Update feature matrices to include entities if they were not included
         # in the one-hot encoding.
         # Also update the feature map while we're at it.
+        fmap = []
         n_ents = len(self.fguide.entities)
         if use_ents:
             if ohc_ents:  # already included in feature map
@@ -1204,10 +1205,10 @@ class PandasTrainTestSplit(PandasDataset):
                 n_cats_total = n_ohc_total
 
                 # Add n_ents to all categorical features in feature map.
-                fmap = [(col, idx + n_ents) for col, idx in fmap]
+                fmap += [(col, idx + n_ents) for col, idx in fmap]
 
                 ent_fmap = zip(self.fguide.entities, range(n_ents))
-                fmap = ent_fmap + fmap
+                fmap += (ent_fmap + fmap)
 
                 # Add entities onto the beginning of the feature matrices.
                 labels = list(self.fguide.entities)
@@ -1226,16 +1227,30 @@ class PandasTrainTestSplit(PandasDataset):
         nf = nf_ents + nf_cats + nf_real
 
         # Add in the real-valued features.
-        next_available_index = fmap[-1][1] + 1
+        only_reals = not use_ents and not use_cats
+        if only_reals:
+            next_available_index = 0
+        else:
+            next_available_index = fmap[-1][1] + 1
+
         real_indices = range(next_available_index, nf + 1)
         fmap += zip(self.fguide.real_valueds, real_indices)
 
         if self.train_reals.shape[1] == 0:
-            train_X = train_enc_cats
-            test_X = test_enc_cats
+            if only_reals:
+                raise ValueError(
+                    "no real values and not using ents or cats")
+            train_X = train_enc_cats.tocsr()
+            test_X = test_enc_cats.tocsr()
         else:
-            train_X = sp.sparse.hstack((train_enc_cats, self.train_reals.values))
-            test_X = sp.sparse.hstack((test_enc_cats, self.test_reals.values))
+            if only_reals:
+                train_X = self.train_reals.values
+                test_X = self.test_reals.values
+            else:
+                train_X = sp.sparse.hstack((
+                    train_enc_cats, self.train_reals.values)).tocsr()
+                test_X = sp.sparse.hstack((
+                    test_enc_cats, self.test_reals.values)).tocsr()
 
         # Log information regarding encoded features.
         logging.info('number of active entity features: %d of %d' % (
@@ -1248,8 +1263,8 @@ class PandasTrainTestSplit(PandasDataset):
         train_y = np.squeeze(self.train_target.values)
         test_y = np.squeeze(self.test_target.values)
 
-        return (train_X.tocsr(), train_y, train_eids,
-                test_X.tocsr(), test_y, test_eids,
+        return (train_X, train_y, train_eids,
+                test_X, test_y, test_eids,
                 fmap, nf_ents)
 
 
