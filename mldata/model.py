@@ -7,6 +7,7 @@ import abc
 import copy
 import json
 import pydoc
+import shutil
 import inspect
 import logging
 import warnings
@@ -223,7 +224,7 @@ class SklearnModel(Model):
         return self.model.predict(X, **filtered_kwargs)
 
 
-class SklearnModelMP(SklearnModel, mp.Process):
+class SklearnModelMP(mp.Process):
     """Multiprocessing variant of SklearnModel."""
 
     def __init__(self, model, split, pipe, *args, **kwargs):
@@ -237,139 +238,27 @@ class SklearnModelMP(SklearnModel, mp.Process):
             pipe (multiprocessing.Pipe): For communication to the parent
                 process -- to communicate results and learned parameters.
         """
-        SklearnModel.__init__(self, model)
         mp.Process.__init__(self, *args, **kwargs)
+        self.model = model
         self.split = split
         self.pipe = pipe
 
     def run(self):
         train_X, train_y, train_eids,\
         test_X, test_y, test_eids, fmap, nents = \
-            self.split.preprocess(all_null='drop', **self.preprocess_args)
+            self.split.preprocess(all_null='drop', **self.model.preprocess_args)
 
         # Extraneous kwargs are filtered by the fit/predict methods.
         kwargs = {'entity_ids': train_eids.values,
                   'feature_indices': fmap,
                   'n_entities': nents}
 
-        self.fit(train_X, train_y, **kwargs)
+        self.model.fit(train_X, train_y, **kwargs)
         kwargs['entity_ids'] = test_eids.values
-        pred_y = self.predict(test_X, **kwargs)
-        self.pipe.send([pred_y, self.split.test, self.split.fguide, self.model])
+        pred_y = self.model.predict(test_X, **kwargs)
+        self.pipe.send([pred_y, self.split.test, self.split.fguide,
+                        self.model.model])
         return 0
-
-
-class SklearnRegressionRunner(object):
-
-    def __init__(self, model, splitter):
-        """Wrap up a Model with a TrainTestSplitter with methods for training
-        the model on the various train/test splits produced by the splitter.
-
-        Args:
-            model (Model): The model to train and predict with.
-            splitter (TrainTestSplitter): The splitter to use for producing
-                train/test data splits.
-        """
-        self.model = model
-        self.splitter = splitter
-
-    def fit_predict(self, split):
-        """Take a TrainTestSplit and train a copy of the model with the same
-        parameters on the train set, and then predict for the test set.  Return
-        a RegressionResults object with the results, including the learned
-        model parameters.
-
-        Args:
-            split (TrainTestSplit): Train on the training data and predict for
-                the test data.
-        Return: instance of ResultsSet.
-        """
-        # Create copy of model with same params.
-        model = self.model.clone()
-
-        train_X, train_y, train_eids,\
-        test_X, test_y, test_eids, fmap, nents = \
-            split.preprocess(all_null='drop', **model.preprocess_args)
-
-        # Extraneous kwargs are filtered by the fit/predict methods.
-        kwargs = {'entity_ids': train_eids.values,
-                  'feature_indices': fmap,
-                  'n_entities': nents}
-        model.fit(train_X, train_y, **kwargs)
-
-        kwargs['entity_ids'] = test_eids.values
-        pred_y = model.predict(test_X, **kwargs)
-        return RegressionResults(pred_y, split.test, split.fguide, model)
-
-    def fit_predict_for_value(self, val):
-        """Get the train/test set for `val`, train a copy of the model with the
-        same parameters on the train set, and then predict for the test set.
-        Return a RegressionResults object with the results, including the
-        learned model parameters.
-
-        Args:
-            val (object): The key to use to lookup the TrainTestSplit using the
-                Splitter. For a PandasDataset, this is a value of the column
-                name being used for splitting.
-        Return: instance of ResultsSet.
-        """
-        split = self.splitter[val]
-        return self.fit_predict(split)
-
-    def fit_predict_all(self, errors='log', parallel=True):
-        """Run sequential fit/predict loop for all possible data splits in a
-        generative manner.
-
-        Outstanding TODOs:
-
-        1.  results not fitting in memory
-        2.  optional reassembly of full data frame with original and predicted
-            results.
-
-        Args:
-            parallel (bool): Run the separate splits using multiple processes
-                if True, else just use single main process. True by default.
-            errors (str): see `mldata.TrainTestSplitter.iteritems`.
-        Return: instance of ResultsSet.
-        """
-        if parallel:
-            return self._fit_predict_all_parallel(errors)
-        else:
-            return self._fit_predict_all(errors)
-
-    def _fit_predict_all(self, errors='log'):
-        """Run sequential fit/predict loop for all possible data splits in a
-        generative manner.
-
-        Args:
-            errors (str): see `mldata.TrainTestSplitter.iteritems`.
-        Return: instance of ResultsSet.
-        """
-        results = {}
-        for val, split in self.splitter.iteritems(errors):
-            logging.info('fit/predict for split {}'.format(val))
-            results[val] = self.fit_predict(split)
-
-        return RegressionResultsSet(results)
-
-    def _fit_predict_all_parallel(self, errors='log'):
-        """Parallel variant of fit_predict_all."""
-        results = {}
-        for key, split in self.splitter.iteritems(errors):
-            parent_conn, child_conn = mp.Pipe()
-            proc = SklearnModelMP(self.model.clone().model, split, child_conn)
-            results[key] = (proc, parent_conn)
-
-            logging.info(
-                'starting process for fit/predict on split {}'.format(key))
-            proc.start()
-
-        for key, (proc, conn) in results.items():
-            pred_y, test, fguide, inner_model = conn.recv()
-            model = SklearnModel(inner_model)
-            results[key] = RegressionResults(pred_y, test, fguide, model)
-
-        return RegressionResultsSet(results)
 
 
 class abstractclassmethod(classmethod):
@@ -748,7 +637,26 @@ class ResultsSet(ResultsBase):
         return {key: result.model.learned_params
                 for (key, result) in self.results.items()}
 
-    def save(self, savedir, ow=False):
+    def save(self, save_dir_or_file, ow=False):
+        if save_dir_or_file.endswith('.pickle'):
+            self.save_pickle(save_dir_or_file, ow)
+        else:
+            self.save_text(save_dir_or_file, ow)
+
+    def save_pickle(self, savefile, ow=False):
+        if not ow and os.path.exists(savefile):
+            raise IOError('File "{}" exists and ow=False)'.format(savefile))
+
+        if ow:
+            try:
+                shutil.rmtree(savefile)
+            except OSError:
+                pass
+
+        with open(savefile, 'w') as f:
+            pickle.dump(self, f, -1)
+
+    def save_text(self, savedir, ow=False):
         """Save all results in the savedir, with each individual result saved
         in a subdirectory named using its key.
 
@@ -785,7 +693,19 @@ class ResultsSet(ResultsBase):
             json.dump(metadata, f)
 
     @classmethod
-    def load(cls, savedir):
+    def load(cls, fname):
+        if fname.endswith('.pickle'):
+            return self.load_pickle(fname)
+        else:
+            return self.load_text(fname)
+
+    @classmethod
+    def load_pickle(cls, fname):
+        with open(fname) as f:
+            return pickle.load(f)
+
+    @classmethod
+    def load_text(cls, savedir):
         """Load Results from the savedir. Mirrors `ResultsSet.save`.
 
         Args:
@@ -829,67 +749,197 @@ class RegressionResultsSet(ResultsSet, RegressionResults):
     pass
 
 
-class PmixorModelMP(SklearnModelMP):
+class SklearnRegressionRunner(object):
 
-    def run(self):
+    # Allow configuratoin through subclass instance variable overrides.
+    _results_class = RegressionResults
+    _results_set_class = RegressionResultsSet
+    _model_class = SklearnModel
+    _model_class_mp = SklearnModelMP
+
+    def __init__(self, model, splitter):
+        """Wrap up a Model with a TrainTestSplitter with methods for training
+        the model on the various train/test splits produced by the splitter.
+
+        Args:
+            model (Model): The model to train and predict with.
+            splitter (TrainTestSplitter): The splitter to use for producing
+                train/test data splits.
+        """
+        self.model = model
+        self.splitter = splitter
+
+    def fit_predict(self, split):
+        """Take a TrainTestSplit and train a copy of the model with the same
+        parameters on the train set, and then predict for the test set.  Return
+        a RegressionResults object with the results, including the learned
+        model parameters.
+
+        Args:
+            split (TrainTestSplit): Train on the training data and predict for
+                the test data.
+        Return: instance of ResultsSet.
+        """
+        # Create copy of model with same params.
+        model = self.model.clone()
+
         train_X, train_y, train_eids,\
         test_X, test_y, test_eids, fmap, nents = \
-            self.split.preprocess(all_null='drop', **self.preprocess_args)
+            split.preprocess(all_null='drop', **model.preprocess_args)
 
         # Extraneous kwargs are filtered by the fit/predict methods.
         kwargs = {'entity_ids': train_eids.values,
                   'feature_indices': fmap,
                   'n_entities': nents}
+        model.fit(train_X, train_y, **kwargs)
 
-        self.fit(train_X, train_y, **kwargs)
         kwargs['entity_ids'] = test_eids.values
-        kwargs['interval'] = 'hpd'
-        pred_y, lower, upper = self.predict(test_X, **kwargs)
-        self.pipe.send([pred_y, lower, upper, self.split.test,
-                        self.split.fguide, self.model])
-        return 0
+        pred_y = model.predict(test_X, **kwargs)
+        return self._results_class(pred_y, split.test, split.fguide, model)
 
+    def fit_predict_for_value(self, val):
+        """Get the train/test set for `val`, train a copy of the model with the
+        same parameters on the train set, and then predict for the test set.
+        Return a RegressionResults object with the results, including the
+        learned model parameters.
 
-class PmixorResults(RegressionResults):
+        Args:
+            val (object): The key to use to lookup the TrainTestSplit using the
+                Splitter. For a PandasDataset, this is a value of the column
+                name being used for splitting.
+        Return: instance of ResultsSet.
+        """
+        split = self.splitter[val]
+        return self.fit_predict(split)
 
-    def __init__(self, predicted, lower, upper, test_data, fguide, model):
-        self.fguide = fguide
-        self._pred_colname = '%s%s' % (fguide.target, self._predicted_suffix)
-        self.test_data = test_data
-        self.test_data.loc[:, self._pred_colname] = predicted
-        self.test_data.loc[:, 'lower'] = lower
-        self.test_data.loc[:, 'upper'] = upper
-        self.model = model
+    def fit_predict_all(self, errors='log', parallel=True):
+        """Run sequential fit/predict loop for all possible data splits in a
+        generative manner.
 
+        Outstanding TODOs:
 
-class PmixorResultsSet(RegressionResultsSet):
+        1.  results not fitting in memory
+        2.  optional reassembly of full data frame with original and predicted
+            results.
 
-    def save(self, fname):
-        with open(fname, 'w') as f:
-            pickle.dump(self, f, -1)
+        Args:
+            parallel (bool): Run the separate splits using multiple processes
+                if True, else just use single main process. True by default.
+            errors (str): see `mldata.TrainTestSplitter.iteritems`.
+        Return: instance of ResultsSet.
+        """
+        if parallel:
+            return self._fit_predict_all_parallel(errors)
+        else:
+            return self._fit_predict_all(errors)
 
-    @classmethod
-    def load(cls, fname):
-        with open(fname) as f:
-            return pickle.load(f)
+    def _fit_predict_all(self, errors='log'):
+        """Run sequential fit/predict loop for all possible data splits in a
+        generative manner.
 
-class PmixorRunner(SklearnRegressionRunner):
+        Args:
+            errors (str): see `mldata.TrainTestSplitter.iteritems`.
+        Return: instance of ResultsSet.
+        """
+        results = {}
+        for val, split in self.splitter.iteritems(errors):
+            logging.info('fit/predict for split {}'.format(val))
+            results[val] = self.fit_predict(split)
+
+        return self._results_set_class(results)
+
+    def _convert_process_results(self, results_tuple):
+        """Override to accept different number of args as result."""
+        pred_y, test, fguide, inner_model = results_tuple
+        model = self._model_class(inner_model)
+        return self._results_class(pred_y, test, fguide, model)
+
+    def _safe_get_results(self, procs, key, timeout=0.1):
+        proc, conn = procs[key]
+        if conn.poll(timeout):
+            try:
+                result_tuple = conn.recv()
+            except Exception as e:
+                logging.error(
+                    'Exception on recv for key "{}": {}'.format(key, e))
+                del procs[key]
+                return
+
+            logging.info("Received results for split {}".format(key))
+
+            conn.close()
+            logging.debug("Closed pipe to child process")
+
+            proc.join()
+            logging.debug("Joined child process")
+
+            del procs[key]
+
+            try:
+                return self._convert_process_results(result_tuple)
+            except ValueError:
+                logging.error(
+                    'Process for key "{}" returned invalid results: {}'.format(
+                        key, result_tuple))
+                return
+        else:
+            if not proc.is_alive() and proc.exitcode != 0:
+                logging.error(
+                    "Process {} died in action;"
+                    " no results for split {}".format(
+                        proc.name, key))
+                del procs[key]
 
     def _fit_predict_all_parallel(self, errors='log'):
         """Parallel variant of fit_predict_all."""
-        results = {}
+        procs = {}
         for key, split in self.splitter.iteritems(errors):
             parent_conn, child_conn = mp.Pipe()
-            proc = PmixorModelMP(self.model.clone().model, split, child_conn)
-            results[key] = (proc, parent_conn)
+            proc = self._model_class_mp(
+                self.model.clone(), split, child_conn,
+                name='{}-{}'.format(self._model_class_mp.__name__, key))
+            procs[key] = (proc, parent_conn)
 
             logging.info(
                 'starting process for fit/predict on split {}'.format(key))
             proc.start()
 
-        for key, (proc, conn) in results.items():
-            pred_y, lower, upper, test, fguide, inner_model = conn.recv()
-            model = SklearnModel(inner_model)
-            results[key] = PmixorResults(pred_y, lower, upper, test, fguide, model)
+        started = procs.keys()
+        logging.info("Started prediction for all splits: {}".format(
+            ','.join(map(str, started))))
 
-        return PmixorResultsSet(results)
+        results = {}
+        timeout = 0.1  # 1/10 of a second
+        while procs:
+            for key in procs.keys():
+                try:
+                    result = self._safe_get_results(procs, key, timeout)
+                    if result is not None:
+                        results[key] = result
+                    else:
+                        if key not in procs:
+                            logging.error(
+                                "Got NoneType result for key {}".format(key))
+                except KeyError:
+                    logging.error("already removed key {}".format(key))
+
+            timeout += 0.1
+            logging.info("Waiting {}s on {}".format(
+                timeout, ','.join(map(str, procs.keys()))))
+
+        # Log summary of prediction outcomes.
+        finished = results.keys()
+        finished_str = ','.join(map(str, finished))
+        finished_str = finished_str if finished_str else None
+
+        failed = set(started) - set(finished)
+        failed_str = ','.join(map(str, failed))
+        failed_str = failed_str if failed_str else None
+
+        logging.info("All splits complete; have results for: {}".format(
+            ','.join(map(str, finished))))
+        logging.info("Failed to get results for: {}".format(
+            ','.join(map(str, failed))))
+
+        return self._results_set_class(results)
+
