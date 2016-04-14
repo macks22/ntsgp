@@ -1230,8 +1230,12 @@ class PandasTrainTestSplit(PandasDataset):
         real_indices = range(next_available_index, nf + 1)
         fmap += zip(self.fguide.real_valueds, real_indices)
 
-        train_X = sp.sparse.hstack((train_enc_cats, self.train_reals.values))
-        test_X = sp.sparse.hstack((test_enc_cats, self.test_reals.values))
+        if self.train_reals.shape[1] == 0:
+            train_X = train_enc_cats
+            test_X = test_enc_cats
+        else:
+            train_X = sp.sparse.hstack((train_enc_cats, self.train_reals.values))
+            test_X = sp.sparse.hstack((test_enc_cats, self.test_reals.values))
 
         # Log information regarding encoded features.
         logging.info('number of active entity features: %d of %d' % (
