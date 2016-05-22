@@ -1,3 +1,4 @@
+import os
 import logging
 import argparse
 
@@ -45,3 +46,11 @@ def parse_and_setup(parser):
         format="[%(asctime)s][%(levelname)s][%(processName)s][%(process)d]:"
                " %(message)s")
     return args
+
+
+def mkdir_ifnexists(dirname):
+    try:
+        os.mkdir(dirname)
+    except OSError:
+        pass
+

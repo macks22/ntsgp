@@ -425,7 +425,7 @@ class PandasFullDataset(PandasDataset):
         """Load the feature configuration and then load the columns present in
         the feature config.
         """
-        self.fguide = fguide = FeatureGuide(config_file)
+        self.fguide = FeatureGuide(config_file)
         self.fname = os.path.abspath(fname)
         self.dataset = self.read(self.fname)
 
@@ -1113,6 +1113,8 @@ class PandasTrainTestSplit(PandasDataset):
         if not columns:
             return None
 
+        logging.info('one-hot-encoding columns: %s' % ','.join(columns))
+
         both_sets = pd.concat((self.train[columns], self.test[columns]))
         encoder = preprocessing.OneHotEncoder()
         encoded = encoder.fit_transform(both_sets).sorted_indices()
@@ -1122,9 +1124,17 @@ class PandasTrainTestSplit(PandasDataset):
         train_enc = encoded[:nd_train]
         test_enc = encoded[nd_train:]
 
+        for col in columns:
+            logging.debug('unique {}: {}'.format(col, both_sets[col].unique()))
+
         # Create a feature map for decoding one-hot encoding.
         counts = np.array([both_sets[col].unique().shape[0] for col in columns])
-        fmap = zip(columns, np.cumsum(counts))
+        fmap = []
+        for i, column in enumerate(columns):
+            unique_elements = np.sort(both_sets[column].unique())
+            logging.debug('unique elements for col {}: {}'.format(
+                column, unique_elements))
+            fmap += ['%s-%d' % (column, idx) for idx in unique_elements]
 
         logging.info('after one-hot encoding, found # unique values:')
         for attr, n_values in zip(columns, counts):
@@ -1196,6 +1206,7 @@ class PandasTrainTestSplit(PandasDataset):
         8.  nents: The number of unique entities for each entity.
 
         """
+        # might be iterable, in which case any elements would make it true
         if remove_cold_start == True:
             self.remove_cold_start()
         elif remove_cold_start:
@@ -1225,10 +1236,9 @@ class PandasTrainTestSplit(PandasDataset):
 
         to_ohc = list(to_ohc)
         if to_ohc:
-            train_enc_cats, test_enc_cats, fmap, encoder = \
-                self.one_hot_encode(to_ohc)
+            train_enc_cats, test_enc_cats, fmap, encoder = self.one_hot_encode(to_ohc)
             n_ohc_total = sum(encoder.n_values_)
-            nf_ohc = encoder.active_features_.shape[0]
+            nf_ohc = len(fmap)
         else:
             # TODO: implement use_cats and ohc_cats args.
             n_ohc_total = 0
@@ -1241,7 +1251,13 @@ class PandasTrainTestSplit(PandasDataset):
         n_ents = len(self.fguide.entities)
         if use_ents:
             if ohc_ents:  # already included in feature map
-                nf_ents = dict(fmap)[self.fguide.entities[-1]]
+                last_ent = self.fguide.entities[-1]
+                pairs = zip(fmap, range(nf_ohc))
+                for name, i in pairs[::-1]:
+                    if last_ent in name:
+                        break
+
+                nf_ents = i + 1  # if 10 active entities, last is at index 9
                 n_ents_total = sum(encoder.n_values_[i] for i in range(n_ents))
                 n_cats_total = n_ohc_total - n_ents_total
             else:  # need to update feature map
@@ -1249,14 +1265,11 @@ class PandasTrainTestSplit(PandasDataset):
                 n_ents_total = n_ents
                 n_cats_total = n_ohc_total
 
-                # Add n_ents to all categorical features in feature map.
-                fmap += [(col, idx + n_ents) for col, idx in fmap]
-
-                ent_fmap = zip(self.fguide.entities, range(n_ents))
-                fmap += (ent_fmap + fmap)
+                # Add to beginning of feature map.
+                labels = list(self.fguide.entities)
+                fmap = labels + fmap
 
                 # Add entities onto the beginning of the feature matrices.
-                labels = list(self.fguide.entities)
                 train_enc_cats = sp.sparse.hstack((
                     self.train[labels].values, train_enc_cats))
                 test_enc_cats = sp.sparse.hstack((
@@ -1273,13 +1286,7 @@ class PandasTrainTestSplit(PandasDataset):
 
         # Add in the real-valued features.
         only_reals = not use_ents and not use_cats
-        if only_reals:
-            next_available_index = 0
-        else:
-            next_available_index = fmap[-1][1] + 1
-
-        real_indices = range(next_available_index, nf + 1)
-        fmap += zip(self.fguide.real_valueds, real_indices)
+        fmap += self.fguide.real_valueds
 
         if self.train_reals.shape[1] == 0:
             if only_reals:

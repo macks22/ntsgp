@@ -256,8 +256,7 @@ class SklearnModelMP(mp.Process):
         self.model.fit(train_X, train_y, **kwargs)
         kwargs['entity_ids'] = test_eids.values
         pred_y = self.model.predict(test_X, **kwargs)
-        self.pipe.send([pred_y, self.split.test, self.split.fguide,
-                        self.model.model])
+        self.pipe.send([pred_y, self.split.test, self.split.fguide, self.model.model])
         return 0
 
 
@@ -930,11 +929,11 @@ class SklearnRegressionRunner(object):
         # Log summary of prediction outcomes.
         finished = results.keys()
         finished_str = ','.join(map(str, finished))
-        finished_str = finished_str if finished_str else None
+        finished_str = finished_str if finished_str else "None"
 
         failed = set(started) - set(finished)
         failed_str = ','.join(map(str, failed))
-        failed_str = failed_str if failed_str else None
+        failed_str = failed_str if failed_str else "None"
 
         logging.info("All splits complete; have results for: {}".format(
             ','.join(map(str, finished))))
