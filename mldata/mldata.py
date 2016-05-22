@@ -27,6 +27,8 @@ class BadFeatureConfig(Exception):
 class FeatureGuide(object):
     """Parse and represent fields of a feature guide."""
 
+    _extension = '.fguide'
+
     """Guide to feature configuration file field letters."""
     config_guide = {
         't': 'target',
@@ -45,6 +47,28 @@ class FeatureGuide(object):
     __slots = [field_name for field_name in sections]
     __slots.append('fname')
     __slots.append('comments')
+
+    @classmethod
+    def add_extension_if_needed(cls, fname):
+        if not fname.endswith(cls._extension):
+            fname += cls._extension
+        return fname
+
+    @classmethod
+    def from_name_lists(cls, fname, **name_lists):
+        rows = []
+        rows.append('# Generated programmaticaly from name lists.')
+        rows.append('#\n')
+        for letter, section_name in cls.config_guide.items():
+            names = name_lists.get(section_name, [])
+            as_string = '%s:%s;' % (letter, ','.join(names))
+            rows.append(as_string)
+
+        fname = cls.add_extension_if_needed(fname)
+        with open(fname, 'w') as f:
+            f.write('\n'.join(rows))
+
+        return cls(fname)
 
     @classmethod
     def parse_config(cls, fname):
@@ -698,6 +722,27 @@ class PandasFullDataset(PandasDataset):
 
     def split_loop(self, col, train_cmp, test_cmp, window=None):
         return PandasDatasetSplitter(self, col, train_cmp, test_cmp, window=None)
+
+
+class PandasDatasetRandomBinarySplitter(object):
+    """Produces random binary splits of the rows, s.t. P% is train and (1-P)% test."""
+
+    def __init__(self, dataset, p):
+        self.dataset = dataset
+        self.p = p
+
+    def split(self):
+        index = self.dataset.dataset.index
+        N = index.shape[0]
+        ntrain = int(N * self.p + 1)
+
+        shuffled = np.random.shuffle(index)
+        train_indices = shuffled[:ntrain]
+        test_indices = shuffled[ntrain:]
+
+        train = self.dataset.ix[train_indices]
+        test = self.dataset.ix[test_indices]
+        return PandasTrainTestSplit.from_dfs(train, test, self.dataset.fguide)
 
 
 class PandasDatasetSplitter(object):
